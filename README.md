@@ -40,8 +40,8 @@ all three keys. The *next* questions automatically select the next
 eligible leg in preference order. When a cooldown expires, the leg
 becomes eligible again — Plan A naturally resumes once it is healthy
 (and is re-benched if it fails again). A leg's internal per-model
-fallback (same key, different model) and the single validation
-self-repair retry stay on the same leg: models are not keys.
+fallback (same key, different model) and the validation
+self-repair retries stay on the same leg: models are not keys.
 
 If **every** configured leg is in cooldown, requests fail fast with
 `503` (plus the earliest retry time) and no provider is called at all.
@@ -77,8 +77,11 @@ automatically tries the next model in the fallback chain (see
 The response carries an `X-Provider: groq|nvidia|groq2` header so you can see
 which provider answered. Generated code is structurally validated
 (C / Java / Python checks) before it is returned; if validation fails,
-the provider gets one self-repair retry with the problem fed back. The
-final result is reported in the `X-Validation` header.
+the provider gets up to two self-repair attempts with the validator's
+exact failure reasons fed back. Only code that PASSES validation is
+ever served or cached: if every attempt fails, the request returns
+`502` with `code: "GENERATION_INVALID"` instead of broken code. The
+`X-Validation` header reports the outcome.
 
 ## Environment Variables
 
@@ -167,13 +170,19 @@ Supported `lang` values include `c`, `java`, `python`, `cpp`,
 `py`, `js`, `c++` work too). If `lang` is omitted, the language is
 detected from the question.
 
-**Naming:** Java answers get a problem-specific class name derived
-from the question — `?q=write+binary+search&lang=java` returns
-`public class BinarySearch`, not a generic `Main`. The response
-carries an `X-Filename: BinarySearch.java` header telling you exactly
-what to save the file as (an explicit `filename` in the request always
-wins). In every language, functions are named after the task
-(`binarySearch`, `is_palindrome`, …), never generic placeholders.
+**Naming:** for Java questions the server derives a problem-specific
+class name from the question (`BinarySearch` for
+`?q=write+binary+search&lang=java`) and asks the model to use it — so
+answers don't come back as a generic `Main`. Helper classes the model
+adds (a `TreeNode` inside a tree program, a `Node` inside a linked
+list) are kept exactly as generated: the server NEVER renames classes
+in returned code. The `X-Filename` header follows the code itself —
+it names the class that actually contains `main()`
+(`X-Filename: BinaryTree.java` when the model's main class is
+`BinaryTree`), so the file you save always matches the code you got
+(an explicit `filename` in the request always wins). In every
+language, functions are named after the task (`binarySearch`,
+`is_palindrome`, …), never generic placeholders.
 
 ---
 
@@ -253,7 +262,7 @@ codeai-project/
 │   │   └── validator.js       # Request validation
 │   └── utils/
 │       ├── groqClient.js      # Groq API + retry + model fallback (primary provider)
-│       ├── className.js       # Derives problem-specific Java class names from prompts
+│       ├── className.js       # Derives the requested Java class name from the prompt; finds the entry class in generated Java so X-Filename follows the code
 │       ├── nvidiaClient.js    # NVIDIA NIM API + model fallback (backup)
 │       ├── aiProvider.js      # Sticky failover (one question = one key): Groq (A) -> NVIDIA (B) -> Groq 2nd key (C)
 │       ├── concurrency.js     # AI concurrency semaphore + queue

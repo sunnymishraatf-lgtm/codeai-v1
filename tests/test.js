@@ -218,6 +218,101 @@ test("empty code fails", () => {
   assert.strictEqual(validateCode("", "python").valid, false);
 });
 
+console.log("\n=== Java Structure / Anti-Mangling Tests (FIXES.md G) ===");
+const { analyzeJavaClasses, findJavaEntryClass, resolveJavaFileBase } = require("../src/utils/className");
+const { fixJavaCode } = require("../src/utils/javaFixer");
+
+const TWO_CLASS_JAVA = [
+  "public class BinaryTree {",
+  "    static class TreeNode {",
+  "        int data;",
+  "        TreeNode left, right;",
+  "        TreeNode(int data) { this.data = data; }",
+  "    }",
+  "    private TreeNode root;",
+  "    public static void main(String[] args) {",
+  "        BinaryTree tree = new BinaryTree();",
+  "    }",
+  "}",
+].join("\n");
+
+// The exact mangled shape the old javaFixer produced live: outer and
+// inner class both renamed to one derived name, the helper's
+// constructor left behind under its original name.
+const MANGLED_JAVA = [
+  "class BinaryTreeLinkedList {",
+  "    static class BinaryTreeLinkedList {",
+  "        int data;",
+  "        BinaryTreeLinkedList left, right;",
+  "        TreeNode(int data) { this.data = data; }",
+  "    }",
+  "    private BinaryTreeLinkedList root;",
+  "    public static void main(String[] args) {",
+  "        BinaryTreeLinkedList tree = new BinaryTreeLinkedList();",
+  "    }",
+  "}",
+].join("\n");
+
+test("entry class is the class containing main, not the last class declared", () => {
+  assert.strictEqual(findJavaEntryClass(TWO_CLASS_JAVA), "BinaryTree");
+});
+test("entry class falls back to the single top-level class when there is no main", () => {
+  assert.strictEqual(findJavaEntryClass("class OnlyOne { int x; }"), "OnlyOne");
+  assert.strictEqual(findJavaEntryClass("class A {} class B {}"), null);
+});
+test("analyzeJavaClasses lists declared + top-level classes", () => {
+  const a = analyzeJavaClasses(TWO_CLASS_JAVA);
+  assert.deepStrictEqual(a.declaredClasses, ["BinaryTree", "TreeNode"]);
+  assert.deepStrictEqual(a.topLevelClasses, ["BinaryTree"]);
+});
+test("resolveJavaFileBase prefers the code's entry class over the prompt-derived name", () => {
+  assert.strictEqual(
+    resolveJavaFileBase(TWO_CLASS_JAVA, "write a java program to implement binary tree using linked list"),
+    "BinaryTree"
+  );
+});
+test("fixJavaCode never renames classes, whatever filename it is given", () => {
+  const out = fixJavaCode(TWO_CLASS_JAVA, "BinaryTreeLinkedList.java");
+  assert.strictEqual(out, TWO_CLASS_JAVA);
+  assert(out.includes("static class TreeNode"));
+  assert(out.includes("TreeNode(int data)"));
+});
+test("two-class Java (helper + main class) passes validation", () => {
+  const r = validateCode(TWO_CLASS_JAVA, "java");
+  assert.strictEqual(r.valid, true, JSON.stringify(r.problems));
+});
+test("mangled Java fails validation: duplicate class name reason", () => {
+  const r = validateCode(MANGLED_JAVA, "java");
+  assert.strictEqual(r.valid, false);
+  assert(
+    r.problems.some((p) => p.includes("more than once") && p.includes("BinaryTreeLinkedList")),
+    JSON.stringify(r.problems)
+  );
+});
+test("mangled Java fails validation: orphan constructor reason", () => {
+  const r = validateCode(MANGLED_JAVA, "java");
+  assert.strictEqual(r.valid, false);
+  assert(
+    r.problems.some((p) => p.includes("constructor") && p.includes("TreeNode")),
+    JSON.stringify(r.problems)
+  );
+});
+test("enum with constructor + constant class bodies is not flagged as orphan", () => {
+  const code = [
+    "public class EnumDemo {",
+    "    enum Size {",
+    "        SMALL(1) { String label() { return \"s\"; } },",
+    "        LARGE(2) { String label() { return \"l\"; } };",
+    "        private final int v;",
+    "        Size(int v) { this.v = v; }",
+    "    }",
+    "    public static void main(String[] args) { System.out.println(Size.SMALL); }",
+    "}",
+  ].join("\n");
+  const r = validateCode(code, "java");
+  assert.strictEqual(r.valid, true, JSON.stringify(r.problems));
+});
+
 console.log("\n=== Concurrency Semaphore Tests ===");
 const { Semaphore } = require("../src/utils/concurrency");
 test("semaphore never exceeds max concurrent", async () => {
@@ -849,8 +944,149 @@ console.log(`=============================\n`);
     assert.deepStrictEqual(tried, ["openai/gpt-oss-120b"]);
   });
 
+  console.log("\n=== Generate Route: validation / repair / cache rules (labeled fakes, TEST ONLY) ===");
+  const express = require("express");
+  const genRouter = require("../src/routes/generate");
+  const {
+    flushCache: flushRouteCache,
+    buildCacheKey: routeBuildCacheKey,
+    getFromCache: routeGetFromCache,
+  } = require("../src/utils/cache");
+
+  // Labeled fake provider (TEST ONLY): returns the scripted contents in
+  // order (the last one repeats), counting calls. stub:false so the
+  // route's repair loop treats it like a real provider.
+  function fakeProvider(sequence) {
+    let calls = 0;
+    const fn = async () => {
+      const item = sequence[Math.min(calls, sequence.length - 1)];
+      calls++;
+      if (item instanceof Error) throw item;
+      return {
+        content: item,
+        usage: { total_tokens: 1 },
+        model: "fake-model",
+        provider: "groq",
+        stub: false,
+      };
+    };
+    fn.calls = () => calls;
+    return fn;
+  }
+
+  async function withRouteApp(fn) {
+    const app = express();
+    app.use(express.json());
+    app.use("/gen", genRouter);
+    const srv = app.listen(0);
+    const base = `http://127.0.0.1:${srv.address().port}/gen`;
+    try {
+      await fn(base);
+    } finally {
+      genRouter.setCallAIForTests(null);
+      srv.close();
+      if (typeof srv.closeAllConnections === "function") {
+        srv.closeAllConnections();
+      }
+    }
+  }
+
+  const postJson = (base, body) =>
+    fetch(base, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  await atest("route: two-class Java served with class names UNCHANGED; X-Filename = main class from the code", async () => {
+    flushRouteCache();
+    const fake = fakeProvider(["```java\n" + TWO_CLASS_JAVA + "\n```"]);
+    genRouter.setCallAIForTests(fake);
+    await withRouteApp(async (base) => {
+      const res = await postJson(base, {
+        prompt: "write a java program to implement binary tree using linked list",
+        language: "java",
+      });
+      const body = await res.text();
+      assert.strictEqual(res.status, 200, body.slice(0, 200));
+      assert.strictEqual(res.headers.get("x-filename"), "BinaryTree.java");
+      assert.strictEqual(res.headers.get("x-validation"), "passed");
+      assert(body.includes("public class BinaryTree"), body.slice(0, 200));
+      assert(body.includes("static class TreeNode"), "helper class must survive post-processing");
+      assert(body.includes("TreeNode(int data)"), "helper constructor must survive post-processing");
+      assert(
+        !body.includes("BinaryTreeLinkedList"),
+        "no class may be renamed to the prompt-derived name"
+      );
+      assert.strictEqual(fake.calls(), 1);
+    });
+  });
+  await atest("route: invalid first attempt -> repair with feedback -> valid regeneration served", async () => {
+    flushRouteCache();
+    const invalid = "public class Foo {\n    int x;\n}\n"; // no main -> invalid
+    const valid =
+      "public class Foo {\n    public static void main(String[] args) { System.out.println(\"ok\"); }\n}\n";
+    const fake = fakeProvider([invalid, valid]);
+    genRouter.setCallAIForTests(fake);
+    await withRouteApp(async (base) => {
+      const res = await postJson(base, { prompt: "print ok in java please", language: "java" });
+      const body = await res.text();
+      assert.strictEqual(res.status, 200, body.slice(0, 200));
+      assert(body.includes("System.out.println"), "must serve the repaired code");
+      assert.strictEqual(res.headers.get("x-repaired"), "1");
+      assert.strictEqual(fake.calls(), 2);
+    });
+  });
+  await atest("route: always-invalid generation -> 502 GENERATION_INVALID, never cached, repeat re-calls provider", async () => {
+    flushRouteCache();
+    const prompt = "draw a house in java";
+    const invalid = "public class Foo {\n    int x;\n}\n";
+    const fake = fakeProvider([invalid]);
+    genRouter.setCallAIForTests(fake);
+    await withRouteApp(async (base) => {
+      const res1 = await postJson(base, { prompt, language: "java" });
+      const j1 = await res1.json();
+      assert.strictEqual(res1.status, 502);
+      assert.strictEqual(j1.code, "GENERATION_INVALID");
+      assert.strictEqual(fake.calls(), 3, "initial attempt + 2 repairs");
+      assert.strictEqual(
+        routeGetFromCache(routeBuildCacheKey(prompt, null, "java")),
+        null,
+        "invalid code must not be cached"
+      );
+      const res2 = await postJson(base, { prompt, language: "java" });
+      await res2.text();
+      assert.strictEqual(res2.status, 502);
+      assert.strictEqual(fake.calls(), 6, "repeat request must be a cache MISS (provider called again)");
+    });
+  });
+  await atest("route: valid answer caches — repeat is a HIT with no extra provider call", async () => {
+    flushRouteCache();
+    const prompt = "print hello world in java";
+    const valid =
+      "public class HelloWorld {\n    public static void main(String[] args) { System.out.println(\"hi\"); }\n}\n";
+    const fake = fakeProvider([valid]);
+    genRouter.setCallAIForTests(fake);
+    await withRouteApp(async (base) => {
+      const r1 = await postJson(base, { prompt, language: "java" });
+      assert.strictEqual(r1.status, 200);
+      assert.strictEqual(r1.headers.get("x-cache"), "MISS");
+      await r1.text();
+      const r2 = await postJson(base, { prompt, language: "java" });
+      assert.strictEqual(r2.status, 200);
+      assert.strictEqual(r2.headers.get("x-cache"), "HIT");
+      assert.strictEqual(
+        r2.headers.get("x-filename"),
+        "HelloWorld.java",
+        "HIT path also derives the filename from the cached code"
+      );
+      await r2.text();
+      assert.strictEqual(fake.calls(), 1);
+    });
+  });
+
   console.log("\n=== Stub-Mode End-to-End Naming Test (TEST ONLY) ===");
-  await atest("GET /api?q=write+binary+search&lang=java -> BinarySearch class + X-Filename (stub mode)", async () => {
+  await atest("GET /api?q=write+binary+search&lang=java -> stub code served UNRENAMED, X-Filename follows the code (stub mode)", async () => {
     process.env.CODEAI_TEST_STUB = "1";
     process.env.PORT = "3217";
     const { server } = require("../src/server");
@@ -863,10 +1099,18 @@ console.log(`=============================\n`);
       const body = await res.text();
       assert.strictEqual(res.status, 200, body.slice(0, 200));
       assert.strictEqual(res.headers.get("x-test-stub"), "1");
-      assert.strictEqual(res.headers.get("x-filename"), "BinarySearch.java");
+      // The stub's code declares `public class Main` with main() in it,
+      // so the filename follows the code: Main.java. Before FIXES.md G
+      // the server renamed the class to the prompt-derived
+      // "BinarySearch" — that renaming machinery is gone.
+      assert.strictEqual(res.headers.get("x-filename"), "Main.java");
       assert(
-        body.includes("public class BinarySearch"),
-        "expected derived class name in code, got: " + body.slice(0, 160)
+        body.includes("public class Main"),
+        "expected the stub's own class name in code, got: " + body.slice(0, 160)
+      );
+      assert(
+        !body.includes("class BinarySearch"),
+        "server must not rename classes in generated code, got: " + body.slice(0, 160)
       );
     } finally {
       delete process.env.CODEAI_TEST_STUB;

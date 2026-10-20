@@ -3,9 +3,16 @@
 // Terminal users never send a filename, so without this every Java answer
 // came back as "public class Main" and students had to rename the class
 // before javac would even accept the file. The generate route uses this
-// to build a derived filename ("BinarySearch.java") which then flows
-// through the existing user-prompt + javaFixer machinery, so the class
-// in the returned code matches the problem.
+// to build a derived filename ("BinarySearch.java") which flows into the
+// user prompt as the REQUESTED public class name, so the model names its
+// class after the problem.
+//
+// The filename in the RESPONSE, however, follows the generated code,
+// never the reverse: analyzeJavaClasses() below finds the class that
+// actually contains main() in the model's output, and that name becomes
+// X-Filename. Nothing on the server ever renames a class in generated
+// code (an earlier javaFixer did, and mangled multi-class answers —
+// see FIXES.md section G).
 //
 // Examples:
 //   "write binary search"      -> BinarySearch
@@ -61,4 +68,80 @@ function deriveClassName(prompt) {
   return name;
 }
 
-module.exports = { deriveClassName };
+// ---------------------------------------------------------------------------
+// Structural analysis of generated Java code.
+// ---------------------------------------------------------------------------
+
+const { stripStringsAndComments } = require("./codeValidator");
+
+// Scan Java source and report:
+//   entryClass      — the type whose body contains `public static void
+//                     main(`, i.e. the innermost type on the brace stack
+//                     when main is seen (null when there is no main).
+//   topLevelClasses — types declared at brace depth 0, in order.
+//   declaredClasses — every declared type name, in order.
+//
+// Strings and comments are stripped first so braces or the word
+// "class" inside them cannot skew the scan. This is a structural
+// heuristic, not a parser — it exists so the response filename can
+// follow the code the model actually wrote.
+function analyzeJavaClasses(code) {
+  const result = { entryClass: null, topLevelClasses: [], declaredClasses: [] };
+  if (!code || typeof code !== "string") return result;
+
+  const stripped = stripStringsAndComments(code, "java");
+  const tokenRe =
+    /\b(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)|\bpublic\s+static\s+void\s+main\s*\(|[{}]/g;
+
+  let depth = 0;
+  let pending = null; // last type name seen, waiting for its opening brace
+  const stack = []; // { name, depth } — depth = brace depth of the type body
+  let m;
+  while ((m = tokenRe.exec(stripped)) !== null) {
+    if (m[1] !== undefined) {
+      pending = m[1];
+      result.declaredClasses.push(m[1]);
+    } else if (m[0] === "{") {
+      depth++;
+      if (pending) {
+        stack.push({ name: pending, depth });
+        if (depth === 1) result.topLevelClasses.push(pending);
+        pending = null;
+      }
+    } else if (m[0] === "}") {
+      while (stack.length && stack[stack.length - 1].depth === depth) {
+        stack.pop();
+      }
+      depth--;
+    } else {
+      // main(): the innermost enclosing type is the entry class.
+      if (!result.entryClass && stack.length) {
+        result.entryClass = stack[stack.length - 1].name;
+      }
+    }
+  }
+  return result;
+}
+
+// The class a Java file should be named after: the one containing
+// main(), else the single top-level class, else null.
+function findJavaEntryClass(code) {
+  const { entryClass, topLevelClasses } = analyzeJavaClasses(code);
+  if (entryClass) return entryClass;
+  if (topLevelClasses.length === 1) return topLevelClasses[0];
+  return null;
+}
+
+// Base name (no extension) for the response filename: the entry class
+// from the code itself; deriveClassName(prompt) only when the code has
+// no identifiable entry class.
+function resolveJavaFileBase(code, prompt) {
+  return findJavaEntryClass(code) || deriveClassName(prompt);
+}
+
+module.exports = {
+  deriveClassName,
+  analyzeJavaClasses,
+  findJavaEntryClass,
+  resolveJavaFileBase,
+};

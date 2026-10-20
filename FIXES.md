@@ -347,3 +347,110 @@ re-eligibility; 429 → rate-limit cooldown, not the general one;
 Retry-After override + 15-min cap; self-repair stays on the same leg;
 failing repair does not fall over). `npm test`: 72 passed, 0 failed.
 `npm run verify`: 18/18 unchanged.
+
+---
+
+## G. Multi-class Java mangling + broken answers were cached (2026-10-20, post-deploy)
+
+**Proven live, twice in one evening:** for "implement binary tree
+using linked list" the API returned code that cannot compile — and the
+second identical request served the same broken body from cache
+(`x-cache: HIT`, `x-validation: failed`):
+
+```java
+class BinaryTreeLinkedList {
+    static class BinaryTreeLinkedList {   // helper renamed to the SAME name
+        int data;
+        BinaryTreeLinkedList left, right;
+        TreeNode(int data) { ... }       // orphan constructor: no TreeNode declared
+    }
+    ...
+}
+```
+
+javac: "invalid method declaration; return type required".
+
+**Root cause — our own post-processing did this** (`src/utils/javaFixer.js`,
+introduced with the E2 naming work): the fixer RENAMED classes in
+generated code to match a prompt-derived filename.
+
+1. Its main-class detection loop overwrote `currentClass` on every
+   `class X` line, so for a nested helper class declared before
+   `main()` (`static class TreeNode`), the "main class" was recorded
+   as the HELPER.
+2. Its reference-fixing step then replaced every `TreeNode␣` token
+   with the derived name — including the helper's own declaration
+   (`static class TreeNode {` → `static class BinaryTreeLinkedList {`)
+   and all its type references — duplicating the outer class name.
+3. The rename patterns required a space or `new` after the name, so
+   the constructor declaration `TreeNode(int data)` was never renamed,
+   leaving an orphan constructor matching no declared class.
+4. Its rename step anchored at line start, so the nested declaration
+   never received the `public` treatment either — the output had no
+   public class at all.
+5. Compounding it, the generate route served the failed-validation
+   result anyway and `setInCache` ran unconditionally, so the broken
+   body was cached and re-served.
+
+Reproduced locally byte-for-byte by feeding a plausible model output
+(public outer class named per the prompt + nested `TreeNode` helper)
+through the old `fixJavaCode`.
+
+**Fixes:**
+
+- **Filename follows the code, not the reverse.** `javaFixer` no
+  longer renames anything — it only strips stray fence lines.
+  `src/utils/className.js` gains `analyzeJavaClasses()` /
+  `findJavaEntryClass()`: a brace-stack scan over string/comment-
+  stripped code that finds the class whose body actually contains
+  `public static void main` (fallback: the single top-level class,
+  then the prompt-derived name). The response `X-Filename` is that
+  class + `.java`, on both MISS and cache-HIT paths. The prompt still
+  ASKS the model for the problem-specific class name; helper classes
+  (`TreeNode`, `Node`, …) are returned exactly as generated. The
+  cache key is built from prompt + user filename + language (it must
+  exist before generation), never from the code-derived name.
+- **Validator catches this breakage class** (`codeValidator.js`):
+  (a) the same type name declared more than once → invalid
+  (`declares class "X" more than once`); (b) a constructor-like
+  declaration whose capitalized name matches no declared
+  class/interface/enum/record → invalid (`constructor "X" does not
+  match any declared class`). Names with no lowercase letters are
+  skipped (enum constants with class bodies are not constructors);
+  the pre-existing public-class rule is unchanged.
+- **Repair loop:** up to **2** self-repair attempts (was 1). Each
+  repair prompt carries the validator's exact failure reasons and
+  instructs a clean regeneration; the conversation accumulates; the
+  first passing result wins. Provider errors from a repair attempt
+  now propagate as their typed error instead of being masked by
+  serving the broken first attempt. All attempts stay on the same
+  provider leg (same `callAI` binding; sticky selector untouched).
+- **Never serve/cache known-broken code:** if all attempts fail
+  validation, the route returns **502** with
+  `code: "GENERATION_INVALID"` ("Couldn't generate valid code for
+  this question — please ask again or rephrase."). Cache writes (and
+  therefore coalesced sharing) happen only for validated results;
+  a repeat of a failed question is a cache MISS that calls the
+  provider again.
+
+**Tests:** 9 new unit tests (entry-class analysis, fixer never
+renames, duplicate/orphan validator reasons, enum false-positive
+guard) + 4 new route tests via a labeled fake provider (two-class
+answer served unchanged with `X-Filename: BinaryTree.java`;
+invalid→valid repair sequence; always-invalid → 502
+GENERATION_INVALID with 3 provider calls and a repeat MISS at 6;
+valid answer still caches as a HIT). The pre-existing stub end-to-end
+test was updated to the new contract: the stub's `public class Main`
+is now served UNRENAMED with `X-Filename: Main.java` (it previously
+asserted the rename to `BinarySearch`). `npm run verify` gains
+Sunny's exact question as a Java regression case (multi-class
+fixture whose main class is `BinaryTree`, deliberately NOT the
+prompt-derived name; filename derived from the code; compiles and
+runs: `Inorder traversal: [2, 3, 4, 5, 6, 7, 8]`).
+
+`npm test`: **85 passed, 0 failed** (was 72). `npm run verify`:
+**19/19** (was 18; +1 for the tree case).
+
+This section supersedes the naming wiring described in E2 (the route
+no longer routes the derived name through javaFixer; javaFixer no
+longer renames) and the "one retry" wording in section B.

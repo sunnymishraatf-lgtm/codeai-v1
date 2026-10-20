@@ -2,14 +2,23 @@ const express = require("express");
 const router = express.Router();
 const { v4: uuidv4 } = require("uuid");
 
-const { callAI } = require("../utils/aiProvider");
+const aiProvider = require("../utils/aiProvider");
 const { SYSTEM_PROMPT } = require("../utils/systemPrompt");
 const { detectLanguage, getClassName } = require("../utils/langDetect");
 const { buildCacheKey, getFromCache, setInCache } = require("../utils/cache");
 const { cleanCode } = require("../utils/codeCleaner");
 const { fixJavaCode } = require("../utils/javaFixer");
 const { validateGenerateRequest } = require("../middleware/validator");
-const { deriveClassName } = require("../utils/className");
+const { deriveClassName, resolveJavaFileBase } = require("../utils/className");
+
+// The provider caller is a module-level binding so tests can substitute
+// a labeled fake (TEST SEAM, tests only — mirrors the deps seam in
+// groqClient.js). Production code always uses aiProvider.callAI, which
+// implements the sticky one-question-one-key failover.
+let callAI = aiProvider.callAI;
+function setCallAIForTests(fn) {
+  callAI = typeof fn === "function" ? fn : aiProvider.callAI;
+}
 const { aiSemaphore } = require("../utils/concurrency");
 const { validateCode } = require("../utils/codeValidator");
 const logger = require("../utils/logger");
@@ -110,7 +119,9 @@ function postProcess(code, language, filename) {
   let result = cleanCode(code, language);
 
   if (language === "java") {
-    result = fixJavaCode(result, filename || "Main.java");
+    // fixJavaCode only strips stray fence lines — it never renames
+    // classes (see its header). The filename argument is unused.
+    result = fixJavaCode(result, filename);
   }
 
   return result;
@@ -121,10 +132,22 @@ function postProcess(code, language, filename) {
 // instance of this runs per cache key at a time.
 //
 // After cleaning, the code goes through structural validation
-// (src/utils/codeValidator.js). If it fails, the AI gets ONE self-repair
-// retry with the validation problems fed back; the better of the two
-// results is returned and the final validation status is reported to the
-// caller (surfaced as the X-Validation response header).
+// (src/utils/codeValidator.js). If it fails, the AI gets up to
+// MAX_REPAIR_ATTEMPTS self-repair attempts: each repair prompt carries
+// the validator's exact failure reasons and asks for a clean
+// regeneration, the conversation accumulates so the model sees its own
+// previous attempt, and the first PASSING result wins. All attempts go
+// through the same callAI binding, so they stay on the same provider
+// leg (sticky failover is enforced inside aiProvider). A provider
+// error from any attempt propagates as its typed error — it is never
+// masked by returning broken code.
+//
+// If every attempt fails validation, runUpstream returns the best
+// attempt with validation.valid === false and the CALLER refuses to
+// serve or cache it (502 GENERATION_INVALID). Known-broken code is
+// never served and never cached.
+const MAX_REPAIR_ATTEMPTS = 2;
+
 async function runUpstream(prompt, filename, detectedLang) {
   const userPrompt = buildUserPrompt(prompt, filename, detectedLang);
 
@@ -133,68 +156,72 @@ async function runUpstream(prompt, filename, detectedLang) {
     { role: "user", content: userPrompt },
   ];
 
+  const callOptions = {
+    temperature: 0.05,
+    top_p: 0.8,
+    max_tokens: 2000,
+  };
+
   const release = await aiSemaphore.acquire();
   try {
-    const first = await callAI(messages, {
-      temperature: 0.05,
-      top_p: 0.8,
-      max_tokens: 2000,
-    });
+    const attempt = async (msgs) => {
+      const result = await callAI(msgs, callOptions);
+      const code = postProcess(result.content, detectedLang, filename);
+      return { result, code, validation: validateCode(code, detectedLang) };
+    };
 
-    let finalCode = postProcess(first.content, detectedLang, filename);
-    let validation = validateCode(finalCode, detectedLang);
+    let latest = await attempt(messages);
+    let best = latest;
+    let conversation = [
+      ...messages,
+      { role: "assistant", content: latest.result.content },
+    ];
     let repaired = false;
 
-    if (!validation.valid && !first.stub) {
+    for (
+      let repair = 1;
+      repair <= MAX_REPAIR_ATTEMPTS && !best.validation.valid && !latest.result.stub;
+      repair++
+    ) {
       logger.warn("Generated code failed validation, attempting self-repair", {
         lang: detectedLang,
-        problems: validation.problems,
+        attempt: repair,
+        problems: latest.validation.problems,
       });
 
-      const repairMessages = [
-        ...messages,
-        { role: "assistant", content: first.content },
-        {
-          role: "user",
-          content:
-            `Your previous code failed validation: ${validation.problems.join("; ")}. ` +
-            "Return the corrected, complete code only. No explanations, no markdown.",
-        },
+      const feedback = {
+        role: "user",
+        content:
+          `The code you just returned failed validation: ${latest.validation.problems.join("; ")}. ` +
+          "Regenerate the COMPLETE corrected code from scratch, fixing every listed problem. " +
+          "Return ONLY the corrected code. No explanations, no markdown.",
+      };
+
+      latest = await attempt([...conversation, feedback]);
+      conversation = [
+        ...conversation,
+        feedback,
+        { role: "assistant", content: latest.result.content },
       ];
 
-      try {
-        const second = await callAI(repairMessages, {
-          temperature: 0.05,
-          top_p: 0.8,
-          max_tokens: 2000,
-        });
-        const secondCode = postProcess(second.content, detectedLang, filename);
-        const secondValidation = validateCode(secondCode, detectedLang);
-
-        // Keep whichever attempt is better (valid beats invalid; fewer
-        // problems beats more).
-        if (
-          secondValidation.valid ||
-          secondValidation.problems.length < validation.problems.length
-        ) {
-          finalCode = secondCode;
-          validation = secondValidation;
-          repaired = true;
-        }
-      } catch (repairErr) {
-        logger.error("Self-repair attempt failed, returning first result", {
-          message: repairErr.message,
-        });
+      // First passing result wins outright; otherwise keep whichever
+      // attempt has fewer problems as the best-so-far.
+      if (
+        latest.validation.valid ||
+        latest.validation.problems.length < best.validation.problems.length
+      ) {
+        best = latest;
+        repaired = true;
       }
     }
 
     return {
-      finalCode,
-      usage: first.usage,
-      model: first.model,
-      provider: first.provider || "groq",
-      stub: !!first.stub,
-      validation,
+      finalCode: best.code,
+      usage: best.result.usage,
+      model: best.result.model,
+      provider: best.result.provider || "groq",
+      stub: !!best.result.stub,
+      validation: best.validation,
       repaired,
     };
   } finally {
@@ -206,24 +233,40 @@ async function generateCode(req, res) {
   const requestId = uuidv4();
 
   const prompt = req.codePrompt;
-  let filename = req.codeFilename;
+  const userFilename = req.codeFilename || "";
   const explicitLang = req.codeLang;
 
   const detectedLang =
-    explicitLang || detectLanguage(prompt, filename);
+    explicitLang || detectLanguage(prompt, userFilename);
 
-  // Java class naming: terminal users never send a filename, so without
-  // this every Java answer came back as "public class Main". For Java
-  // requests with no explicit filename, derive one from the problem
-  // ("write binary search" -> "BinarySearch.java"). It flows through
-  // the user prompt and javaFixer, so the returned class is
-  // problem-specific, and the X-Filename header tells the user what to
-  // save the file as. An explicit user filename always wins.
-  if (detectedLang === "java" && !filename) {
-    filename = deriveClassName(prompt) + ".java";
-  }
+  // Java class naming has two halves:
+  // - REQUESTED name: terminal users never send a filename, so for Java
+  //   with no explicit filename we derive one from the problem ("write
+  //   binary search" -> "BinarySearch") and the user prompt ASKS the
+  //   model to use it as its public class name. An explicit user
+  //   filename always wins.
+  // - RESPONSE filename (X-Filename): derived from the generated code
+  //   itself — the class that actually contains main() — never the
+  //   reverse. The server does not rename classes in generated code
+  //   (see javaFixer.js and FIXES.md section G), so the filename
+  //   follows whatever the model actually wrote.
+  const requestedFilename =
+    detectedLang === "java" && !userFilename
+      ? deriveClassName(prompt) + ".java"
+      : userFilename;
 
-  const cacheKey = buildCacheKey(prompt, filename, detectedLang);
+  // The cache key must be computable BEFORE generation, so it is built
+  // from the prompt + the user's filename (or none) + language — never
+  // from the code-derived response filename.
+  const cacheKey = buildCacheKey(prompt, userFilename || null, detectedLang);
+
+  const responseFilenameFor = (code) => {
+    if (userFilename) return userFilename;
+    if (detectedLang === "java") {
+      return resolveJavaFileBase(code, prompt) + ".java";
+    }
+    return "";
+  };
 
   const cached = getFromCache(cacheKey);
 
@@ -232,7 +275,8 @@ async function generateCode(req, res) {
 
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Language", detectedLang);
-    if (filename) res.setHeader("X-Filename", filename);
+    const hitFilename = responseFilenameFor(cached);
+    if (hitFilename) res.setHeader("X-Filename", hitFilename);
     res.setHeader("X-Request-Id", requestId);
 
     return res.status(200).type("text/plain").send(cached);
@@ -241,16 +285,22 @@ async function generateCode(req, res) {
   logger.info("Generating code", {
     requestId,
     lang: detectedLang,
-    filename,
+    filename: requestedFilename,
   });
 
   try {
     // Coalesce concurrent identical requests onto one upstream call.
     let shared = inFlight.get(cacheKey);
     if (!shared) {
-      shared = runUpstream(prompt, filename, detectedLang)
+      shared = runUpstream(prompt, requestedFilename, detectedLang)
         .then((result) => {
-          setInCache(cacheKey, result.finalCode);
+          // Only validated code may enter the cache. (Coalescing
+          // follows the same rule: waiters on an invalid result all
+          // get the GENERATION_INVALID error below, and nothing is
+          // stored for the next identical request.)
+          if (result.validation?.valid) {
+            setInCache(cacheKey, result.finalCode);
+          }
           return result;
         })
         .finally(() => {
@@ -262,6 +312,25 @@ async function generateCode(req, res) {
     const { finalCode, usage, model, provider, stub, validation, repaired } =
       await shared;
 
+    // Never serve known-broken code: if the initial attempt and every
+    // repair failed validation, the question gets an honest typed
+    // error instead of code that cannot compile.
+    if (!validation?.valid) {
+      logger.warn("Generation failed validation after all attempts; refusing to serve", {
+        requestId,
+        lang: detectedLang,
+        problems: validation?.problems,
+      });
+      return res.status(502).json({
+        error:
+          "Couldn't generate valid code for this question — " +
+          "please ask again or rephrase.",
+        code: "GENERATION_INVALID",
+        problems: validation?.problems || [],
+        requestId,
+      });
+    }
+
     logger.info("Code generated", {
       requestId,
       lang: detectedLang,
@@ -269,23 +338,19 @@ async function generateCode(req, res) {
       provider,
       tokens: usage?.total_tokens,
       stub,
-      validation: validation?.valid ? "passed" : validation?.problems,
+      validation: "passed",
       repaired,
     });
 
     res.setHeader("X-Cache", "MISS");
     res.setHeader("X-Language", detectedLang);
-    if (filename) res.setHeader("X-Filename", filename);
+    const responseFilename = responseFilenameFor(finalCode);
+    if (responseFilename) res.setHeader("X-Filename", responseFilename);
     res.setHeader("X-Model", model);
     res.setHeader("X-Provider", provider);
     res.setHeader("X-Request-Id", requestId);
     res.setHeader("X-Tokens-Used", usage?.total_tokens || 0);
-    res.setHeader(
-      "X-Validation",
-      validation?.valid
-        ? "passed"
-        : `failed: ${(validation?.problems || []).join("; ")}`
-    );
+    res.setHeader("X-Validation", "passed");
     if (repaired) res.setHeader("X-Repaired", "1");
     if (stub) res.setHeader("X-Test-Stub", "1");
 
@@ -373,3 +438,6 @@ router.post("/", validateGenerateRequest, generateCode);
 router.get("/", validateGenerateRequest, generateCode);
 
 module.exports = router;
+// TEST SEAM (tests only): substitute the provider caller. See the
+// declaration near the top of this file.
+module.exports.setCallAIForTests = setCallAIForTests;

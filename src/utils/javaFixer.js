@@ -1,64 +1,33 @@
+// Java post-processing — deliberately conservative.
+//
+// HISTORY (the bug this rewrite fixes, FIXES.md section G): this module
+// used to RENAME classes in generated code to match a filename derived
+// from the student's question. Its main-class detection took the LAST
+// `class X` line seen before main() — for multi-class answers (a tree
+// with a nested TreeNode helper) that is the HELPER class, not the
+// class containing main. It then blanket-renamed every occurrence of
+// the helper's name to the derived name: the helper's own declaration
+// and all its type references were renamed, its constructor was not
+// (the pattern needed a space after the name), producing a duplicate
+// class name and an orphan constructor — code that cannot compile.
+//
+// RULE NOW: the filename follows the code, never the reverse. The
+// model names its classes (the user prompt ASKS for the problem-
+// specific name), the route derives X-Filename from the class that
+// actually contains main() (see className.js analyzeJavaClasses), and
+// this function only strips stray markdown fence lines that survived
+// cleaning. It must NEVER rename, add, or remove a class or member.
+//
+// The `filename` parameter is kept for call-site compatibility and is
+// intentionally unused.
 function fixJavaCode(code, filename) {
   if (!code) return code;
 
-  const className = filename
-    ? filename.replace(/\.java$/i, "")
-    : "Main";
-
-  let lines = code.split("\n");
-
-  // Find which class contains main()
-  let mainClassName = null;
-  let currentClass = null;
-  for (const line of lines) {
-    const classMatch = line.match(/(?:public\s+)?class\s+(\w+)/);
-    if (classMatch) currentClass = classMatch[1];
-    if (line.includes("public static void main") && currentClass) {
-      mainClassName = currentClass;
-    }
-  }
-
-  if (!mainClassName) return code;
-
-  // Step 1: Remove public from ALL classes
-  lines = lines.map(line =>
-    line.replace(/^(\s*)public\s+(class\s+)/, "$1$2")
-  );
-
-  // Step 2: Rename the class that has main() to match filename
-  // and make it public
-  let renamed = false;
-  lines = lines.map(line => {
-    if (!renamed) {
-      const match = line.match(/^(\s*)class\s+(\w+)(.*)$/);
-      if (match && match[2] === mainClassName) {
-        renamed = true;
-        return `${match[1]}public class ${className}${match[3]}`;
-      }
-    }
-    return line;
-  });
-
-  // Step 3: Fix any constructor calls that used the old class name
-  if (mainClassName !== className) {
-    lines = lines.map(line =>
-      line.replace(
-        new RegExp(`\\bnew\\s+${mainClassName}\\s*\\(`, "g"),
-        `new ${className}(`
-      ).replace(
-        new RegExp(`\\b${mainClassName}\\s+`, "g"),
-        `${className} `
-      )
-    );
-  }
-
-  // Step 4: Strip any remaining markdown fences aggressively
-  const result = lines
-    .filter(line => !line.trim().startsWith("```"))
+  return code
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("```"))
     .join("\n")
     .trim();
-
-  return result;
 }
 
 module.exports = { fixJavaCode };

@@ -5,10 +5,14 @@
 // (codeCleaner -> javaFixer -> codeValidator) actually compiles and runs
 // error-free for C, Java, and Python.
 //
-// Method: for 6 classic problems x 3 languages, take a REALISTIC MESSY
-// raw output (markdown fences + chatter — hand-written FIXTURES, labeled
-// as such; these are NOT claimed to be AI output), run it through the
-// pipeline, write the result to a temp file, then really compile/run it:
+// Method: for 6 classic problems x 3 languages, plus a Java-only
+// multi-class regression case (binary tree with a nested node class),
+// take a REALISTIC MESSY raw output (markdown fences + chatter —
+// hand-written FIXTURES, labeled as such; these are NOT claimed to be
+// AI output), run it through the pipeline, write the result to a temp
+// file, then really compile/run it. For Java the file is named after
+// the class that actually contains main() in the fixture — the
+// pipeline must never rename a class to make a filename fit:
 //   C      -> gcc -std=c11 ... && ./prog
 //   Python -> python3 file.py
 //   Java   -> javac File.java && java Class   (SKIPPED, with a loud
@@ -30,6 +34,7 @@ const { execFile } = require("child_process");
 const { cleanCode } = require("../src/utils/codeCleaner");
 const { fixJavaCode } = require("../src/utils/javaFixer");
 const { validateCode } = require("../src/utils/codeValidator");
+const { findJavaEntryClass } = require("../src/utils/className");
 
 function run(cmd, args, opts = {}) {
   return new Promise((resolve) => {
@@ -94,14 +99,21 @@ const PROBLEMS = [
     java: "```java\npublic class Main {\n    public static void main(String[] args) {\n        int[] arr = {5, 2, 9, 1, 7};\n        for (int i = 0; i < arr.length - 1; i++) {\n            for (int j = 0; j < arr.length - 1 - i; j++) {\n                if (arr[j] > arr[j + 1]) {\n                    int t = arr[j]; arr[j] = arr[j + 1]; arr[j + 1] = t;\n                }\n            }\n        }\n        for (int i = 0; i < arr.length; i++) {\n            System.out.print(arr[i]);\n            if (i < arr.length - 1) System.out.print(\" \");\n        }\n        System.out.println();\n    }\n}\n```",
     python: "```python\narr = [5, 2, 9, 1, 7]\nfor i in range(len(arr) - 1):\n    for j in range(len(arr) - 1 - i):\n        if arr[j] > arr[j + 1]:\n            arr[j], arr[j + 1] = arr[j + 1], arr[j]\nprint(\" \".join(str(x) for x in arr))\n```",
   },
+  {
+    // Regression case for the multi-class mangling bug (FIXES.md G),
+    // using Sunny's exact question. The fixture's main class is
+    // "BinaryTree" — NOT the prompt-derived "BinaryTreeLinkedList" —
+    // with a nested TreeNode helper class. The pipeline must keep both
+    // class names exactly as written, derive the filename from the
+    // code (BinaryTree.java), and the result must compile and run.
+    id: "binary-tree-linked-list",
+    prompt: "write a java program to implement binary tree using linked list",
+    expectedStdout: "Inorder traversal: [2, 3, 4, 5, 6, 7, 8]",
+    expectedEntryClass: "BinaryTree",
+    mustContain: ["static class TreeNode", "TreeNode(int data)"],
+    java: "Here is the code:\n\n```java\nimport java.util.*;\n\npublic class BinaryTree {\n    static class TreeNode {\n        int data;\n        TreeNode left, right;\n        TreeNode(int data) { this.data = data; }\n    }\n    private TreeNode root;\n    public void insert(int value) { root = insertRec(root, value); }\n    private TreeNode insertRec(TreeNode node, int value) {\n        if (node == null) return new TreeNode(value);\n        if (value < node.data) node.left = insertRec(node.left, value);\n        else if (value > node.data) node.right = insertRec(node.right, value);\n        return node;\n    }\n    private void inorder(TreeNode node, List<Integer> list) {\n        if (node == null) return;\n        inorder(node.left, list);\n        list.add(node.data);\n        inorder(node.right, list);\n    }\n    public static void main(String[] args) {\n        BinaryTree tree = new BinaryTree();\n        int[] values = {5, 3, 7, 2, 4, 6, 8};\n        for (int v : values) tree.insert(v);\n        List<Integer> result = new ArrayList<>();\n        tree.inorder(tree.root, result);\n        System.out.println(\"Inorder traversal: \" + result);\n    }\n}\n```",
+  },
 ];
-
-function javaClassName(problemId) {
-  return problemId
-    .split("-")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join("");
-}
 
 async function checkC(problem, dir) {
   const file = path.join(dir, "main.c");
@@ -133,16 +145,25 @@ async function checkPython(problem, dir) {
 }
 
 async function checkJava(problem, dir, javacAvailable) {
-  const className = javaClassName(problem.id);
-  const filename = className + ".java";
   let code = cleanCode(problem.java, "java");
-  code = fixJavaCode(code, filename);
+  code = fixJavaCode(code);
   const v = validateCode(code, "java");
   if (!v.valid) return { status: "FAIL", detail: "validator: " + v.problems.join("; ") };
-  if (!code.includes(`public class ${className}`))
-    return { status: "FAIL", detail: `javaFixer did not rename main class to ${className}` };
+  // The filename follows the code, never the reverse: the entry class
+  // is the class that actually contains main() in the fixture, and the
+  // pipeline must not have renamed anything to get there.
+  const className = findJavaEntryClass(code);
+  if (!className)
+    return { status: "FAIL", detail: "no entry class (class containing main) found" };
+  if (problem.expectedEntryClass && className !== problem.expectedEntryClass)
+    return { status: "FAIL", detail: `entry class "${className}" != expected "${problem.expectedEntryClass}"` };
+  for (const frag of problem.mustContain || []) {
+    if (!code.includes(frag))
+      return { status: "FAIL", detail: `pipeline altered the code: missing "${frag}"` };
+  }
   if (!javacAvailable)
     return { status: "SKIP", detail: "javac NOT installed — structural validation only, compile NOT verified" };
+  const filename = className + ".java";
   const file = path.join(dir, filename);
   fs.writeFileSync(file, code);
   const comp = await run("javac", [file]);
@@ -168,11 +189,12 @@ async function checkJava(problem, dir, javacAvailable) {
   for (const problem of PROBLEMS) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codeai-verify-"));
     const results = {};
-    results.c = gccAvailable ? await checkC(problem, dir) : { status: "SKIP", detail: "gcc missing" };
-    results.python = pythonAvailable ? await checkPython(problem, dir) : { status: "SKIP", detail: "python3 missing" };
-    results.java = await checkJava(problem, dir, javacAvailable);
+    if (problem.c) results.c = gccAvailable ? await checkC(problem, dir) : { status: "SKIP", detail: "gcc missing" };
+    if (problem.python) results.python = pythonAvailable ? await checkPython(problem, dir) : { status: "SKIP", detail: "python3 missing" };
+    if (problem.java) results.java = await checkJava(problem, dir, javacAvailable);
     for (const lang of ["c", "java", "python"]) {
       const r = results[lang];
+      if (!r) continue;
       if (r.status === "PASS") pass++;
       else if (r.status === "SKIP") skip++;
       else fail++;
