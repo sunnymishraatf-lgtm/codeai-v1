@@ -10,7 +10,7 @@ router.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
     env: process.env.NODE_ENV || "development",
-    model: process.env.MODEL || "llama-3.3-70b-versatile",
+    model: process.env.MODEL || "openai/gpt-oss-120b",
     groqKeyConfigured: !!process.env.GROQ_API_KEY,
     nvidiaKeyConfigured: !!process.env.NVIDIA_API_KEY,
     providers: {

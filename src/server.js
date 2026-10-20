@@ -96,7 +96,7 @@ const server = app.listen(PORT, () => {
   logger.info(`CodeAI API server started`, {
     port: PORT,
     env: process.env.NODE_ENV || "development",
-    model: process.env.MODEL || "llama-3.3-70b-versatile",
+    model: process.env.MODEL || "openai/gpt-oss-120b",
     groqKeySet: !!process.env.GROQ_API_KEY,
     nvidiaKeySet: !!process.env.NVIDIA_API_KEY,
   });

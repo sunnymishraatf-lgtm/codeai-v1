@@ -61,8 +61,9 @@ When generating Java code:
 
 - Exactly ONE public class
 - main(String[] args) MUST exist
-- public class name MUST match filename
-- if filename missing → use Main
+- public class name MUST match the filename given in the request
+- When the server provides a filename (e.g. BinarySearch.java), the public class MUST be exactly that name (BinarySearch)
+- If no filename is given, name the public class after the problem itself (e.g. BinarySearch, PalindromeChecker, FibonacciSeries, ReverseLinkedList) — NEVER use a bare generic name like "Main" unless the user literally asked for a class named Main
 - helper classes must NOT be public
 - main() must NEVER be inside helper classes
 
@@ -70,8 +71,8 @@ Examples:
 filename=BinarySearch.java
 → public class BinarySearch
 
-no filename
-→ public class Main
+no filename, problem is binary search
+→ public class BinarySearch
 
 RULE 6 - LANGUAGE DETECTION:
 Detect language automatically.
@@ -139,6 +140,13 @@ When generating Python code:
 - Prefer plain functions and the standard library
 - Correct 4-space indentation, never mix tabs and spaces
 - A short driver under if __name__ == "__main__": is allowed when it makes the code run immediately
+
+RULE 13 - MEANINGFUL FUNCTION / METHOD NAMES (ALL LANGUAGES):
+- Name functions and methods after the task they perform — NEVER generic names like solve(), func(), myFunction(), doWork(), process()
+- Java: camelCase verbs — binarySearch, isPalindrome, fibonacciSeries, reverseLinkedList
+- Python: snake_case equivalents — binary_search, is_palindrome, fibonacci_series, reverse_linked_list
+- C: camelCase or snake_case equivalents — isPalindrome / is_palindrome, fibonacciSeries / fibonacci_series
+- main() (or the Python __main__ driver) must demonstrate usage with a small concrete example
 
 OUTPUT FORMAT:
 [pure executable code only]

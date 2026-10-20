@@ -9,6 +9,7 @@ const { buildCacheKey, getFromCache, setInCache } = require("../utils/cache");
 const { cleanCode } = require("../utils/codeCleaner");
 const { fixJavaCode } = require("../utils/javaFixer");
 const { validateGenerateRequest } = require("../middleware/validator");
+const { deriveClassName } = require("../utils/className");
 const { aiSemaphore } = require("../utils/concurrency");
 const { validateCode } = require("../utils/codeValidator");
 const logger = require("../utils/logger");
@@ -205,11 +206,22 @@ async function generateCode(req, res) {
   const requestId = uuidv4();
 
   const prompt = req.codePrompt;
-  const filename = req.codeFilename;
+  let filename = req.codeFilename;
   const explicitLang = req.codeLang;
 
   const detectedLang =
     explicitLang || detectLanguage(prompt, filename);
+
+  // Java class naming: terminal users never send a filename, so without
+  // this every Java answer came back as "public class Main". For Java
+  // requests with no explicit filename, derive one from the problem
+  // ("write binary search" -> "BinarySearch.java"). It flows through
+  // the user prompt and javaFixer, so the returned class is
+  // problem-specific, and the X-Filename header tells the user what to
+  // save the file as. An explicit user filename always wins.
+  if (detectedLang === "java" && !filename) {
+    filename = deriveClassName(prompt) + ".java";
+  }
 
   const cacheKey = buildCacheKey(prompt, filename, detectedLang);
 
@@ -220,6 +232,7 @@ async function generateCode(req, res) {
 
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Language", detectedLang);
+    if (filename) res.setHeader("X-Filename", filename);
     res.setHeader("X-Request-Id", requestId);
 
     return res.status(200).type("text/plain").send(cached);
@@ -262,6 +275,7 @@ async function generateCode(req, res) {
 
     res.setHeader("X-Cache", "MISS");
     res.setHeader("X-Language", detectedLang);
+    if (filename) res.setHeader("X-Filename", filename);
     res.setHeader("X-Model", model);
     res.setHeader("X-Provider", provider);
     res.setHeader("X-Request-Id", requestId);

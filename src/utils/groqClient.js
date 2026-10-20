@@ -1,6 +1,63 @@
 const Groq = require("groq-sdk");
 const logger = require("./logger");
 
+// ---------------------------------------------------------------------------
+// GROQ MODEL SELECTION
+//
+// MODEL REALITY CHECK (live evidence, 2026-10-20): Groq moved
+// llama-3.3-70b-versatile to enterprise-only "contact sales" pricing in
+// August 2026, so a normal free/self-serve key gets
+// 404 model_not_found for it — the deployed app broke exactly that way,
+// and setting MODEL=openai/gpt-oss-120b brought it back (verified live
+// with real answers). The self-serve production model
+// openai/gpt-oss-120b is therefore the default now.
+//
+// Groq retires models regularly, so a single pinned name is fragile:
+// if the chosen model answers model_not_found, the next candidate in
+// the list is tried automatically (mirroring the NVIDIA client).
+// Set GROQ_MODELS="model-a,model-b,..." to replace the built-in
+// fallback list; options.model / MODEL still take precedence as the
+// first candidate.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_MODEL = "openai/gpt-oss-120b";
+
+const MODEL_FALLBACKS = [
+  "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "qwen/qwen3-32b",
+];
+
+function candidateModels(options = {}) {
+  const chosen = options.model || process.env.MODEL || null;
+
+  if (process.env.GROQ_MODELS) {
+    const list = process.env.GROQ_MODELS.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (list.length > 0) {
+      // GROQ_MODELS replaces the built-in fallback list; an explicitly
+      // chosen model (options.model / MODEL) still goes first.
+      return [...new Set([...(chosen ? [chosen] : []), ...list])];
+    }
+  }
+
+  return [...new Set([chosen || DEFAULT_MODEL, ...MODEL_FALLBACKS])];
+}
+
+function isModelNotFound(err) {
+  // Only a genuine "this model does not exist / you have no access"
+  // response may advance to the next candidate model. Groq returns
+  // HTTP 404 with error code "model_not_found" for retired or
+  // enterprise-gated models (seen live on 2026-10-20).
+  if (err?.status !== 404) return false;
+  const code = err?.code || err?.error?.code || err?.error?.type || "";
+  if (code === "model_not_found") return true;
+  const msg = (err?.message || "").toLowerCase();
+  return msg.includes("model_not_found") || msg.includes("does not exist");
+}
+
 let groqClient = null;
 
 function getClient() {
@@ -61,58 +118,99 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function callGroqWithRetry(messages, options = {}, retries = 3) {
-  const model = options.model || process.env.MODEL || "llama-3.3-70b-versatile";
+// deps.createCompletion is a TEST seam: unit tests inject a labeled fake
+// completion function instead of the real Groq SDK call. Production code
+// never passes it.
+async function callGroqWithRetry(messages, options = {}, retries = 3, deps = {}) {
+  const models = candidateModels(options);
 
   if (isStubMode()) {
-    return callStub(messages, options, model);
+    return callStub(messages, options, models[0]);
   }
 
-  const client = getClient();
+  const createCompletion =
+    deps.createCompletion ||
+    (async (params) => getClient().chat.completions.create(params));
+
   const maxTokens = options.max_tokens || parseInt(process.env.MAX_TOKENS || "8192");
   const temperature = options.temperature ?? 0.1;
   const topP = options.top_p ?? 1;
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await client.chat.completions.create({
-        model,
-        max_tokens: maxTokens,
-        temperature,
-        top_p: topP,
-        messages,
-      });
+  let lastErr = null;
 
-      const content = response?.choices?.[0]?.message?.content || "";
-      const usage = response?.usage || {};
-      return { content, usage, model };
-    } catch (err) {
-      const isRetryable =
-        err?.status === 429 ||
-        err?.status === 503 ||
-        err?.status === 502 ||
-        err?.code === "ECONNRESET" ||
-        err?.code === "ETIMEDOUT" ||
-        err?.name === "APIConnectionError";
-
-      if (isRetryable && attempt < retries) {
-        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-        logger.warn(`Groq API attempt ${attempt} failed, retrying in ${delay}ms`, {
-          status: err?.status,
-          code: err?.code,
+  for (const model of models) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const response = await createCompletion({
+          model,
+          max_tokens: maxTokens,
+          temperature,
+          top_p: topP,
+          messages,
         });
-        await sleep(delay);
-        continue;
-      }
 
-      logger.error("Groq API call failed after retries", {
-        attempt,
-        status: err?.status,
-        message: err?.message,
+        const content = response?.choices?.[0]?.message?.content || "";
+        const usage = response?.usage || {};
+        return { content, usage, model };
+      } catch (err) {
+        // Model retired / not accessible: retrying the same model is
+        // pointless — move on to the next candidate model.
+        if (isModelNotFound(err)) {
+          lastErr = err;
+          break;
+        }
+
+        const isRetryable =
+          err?.status === 429 ||
+          err?.status === 503 ||
+          err?.status === 502 ||
+          err?.code === "ECONNRESET" ||
+          err?.code === "ETIMEDOUT" ||
+          err?.name === "APIConnectionError";
+
+        if (isRetryable && attempt < retries) {
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+          logger.warn(`Groq API attempt ${attempt} failed, retrying in ${delay}ms`, {
+            model,
+            status: err?.status,
+            code: err?.code,
+          });
+          await sleep(delay);
+          continue;
+        }
+
+        logger.error("Groq API call failed after retries", {
+          model,
+          attempt,
+          status: err?.status,
+          message: err?.message,
+        });
+        throw err;
+      }
+    }
+
+    if (lastErr && model !== models[models.length - 1]) {
+      logger.warn("Groq model unavailable, trying next model", {
+        model,
+        status: lastErr?.status,
       });
-      throw err;
     }
   }
+
+  // Every candidate model answered model_not_found.
+  logger.error("Groq API call failed: no candidate model available", {
+    models,
+    message: lastErr?.message,
+  });
+  throw lastErr;
 }
 
-module.exports = { callGroqWithRetry, isStubMode, getStubCallCount };
+module.exports = {
+  callGroqWithRetry,
+  isStubMode,
+  getStubCallCount,
+  candidateModels,
+  isModelNotFound,
+  GROQ_MODELS: MODEL_FALLBACKS,
+  DEFAULT_MODEL,
+};

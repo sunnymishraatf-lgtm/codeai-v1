@@ -196,3 +196,73 @@ everyone. All values remain env-overridable.
 - Suspicion, not proven: the Groq SDK `^0.3.3` is old; it installed
   and constructed fine here, but a future major SDK bump is worth
   reviewing with a real key in hand.
+
+## E. Post-deploy finishing touches (2026-10-20, after the live deploy)
+
+Two more fixes, both found/proven AFTER the service went live on
+Render (https://codeai-v1-35ul.onrender.com). Additive only; the full
+test suite grew from 46 to 61 tests, all green, and `npm run verify`
+still passes 18/18.
+
+### E1. Groq default model was dead for free keys — new default + fallback
+- **Live evidence:** the deployed app, using Sunny's real (free) Groq
+  key, answered every generation request with Groq's
+  `404 model_not_found` for `llama-3.3-70b-versatile` ("does not exist
+  or you do not have access to it"). Groq had moved Llama 3.3 70B (and
+  Llama 3.1 8B) to enterprise-only "contact sales" pricing on
+  2026-08-26. Setting `MODEL=openai/gpt-oss-120b` in the Render env
+  immediately restored real answers (Java/C/Python verified live,
+  compiled and run) — but the CODE default still pointed at the dead
+  model, so any fresh setup without that env rescue would break again.
+- **Fix:** default changed to `openai/gpt-oss-120b` everywhere it
+  appears (`groqClient.js`, `server.js`, `admin.js` health,
+  `.env.example`, README, `render.yaml`).
+- **Fallback added** (`groqClient.js`, mirroring the NVIDIA client):
+  candidates are `[options.model || MODEL || openai/gpt-oss-120b,
+  openai/gpt-oss-20b, meta-llama/llama-4-scout-17b-16e-instruct,
+  qwen/qwen3-32b]` (deduped). Only a genuine `model_not_found`
+  (HTTP 404 with code `model_not_found` / "does not exist" message)
+  advances to the next model; 429/502/503/connection errors keep the
+  existing per-model retry-with-backoff, and other errors surface
+  immediately without cycling models. `GROQ_MODELS` (comma-separated)
+  replaces the built-in fallback list when set.
+- **Tests (labeled stubs):** candidate-list defaults + `MODEL`
+  precedence, `GROQ_MODELS` replacement, strict `isModelNotFound`
+  matching, first-model-404 → second-model-answers, 401 does NOT cycle
+  models (exactly one attempt).
+
+### E2. Every Java answer used class "Main" — problem-specific naming
+- **Root cause:** `systemPrompt.js` RULE 5 said "if filename missing
+  → use Main", `javaFixer.js` defaulted the class name to "Main" when
+  no filename was given — and terminal (curl) users never send a
+  filename, so every student's file was `Main.java` with
+  `public class Main`, and every program had to be renamed by hand
+  before `javac` would accept the obvious filename.
+- **Fix:** new `src/utils/className.js` — `deriveClassName(prompt)`
+  strips request filler and language words, PascalCases the remaining
+  problem words (max ~4 words / 40 chars, digit-leading names get a
+  `Program` prefix), and falls back to `Solution`, never `Main`.
+  Examples: "write binary search" → `BinarySearch`, "check
+  palindrome" → `CheckPalindrome`, "fibonacci series" →
+  `FibonacciSeries`, "reverse a linked list" → `ReverseLinkedList`,
+  "bubble sort" → `BubbleSort`, "" → `Solution`.
+- **Wiring:** in the generate route (shared by `POST /generate`,
+  `GET /generate`, and the `GET /api` mount), a Java request with no
+  explicit filename gets `filename = deriveClassName(prompt) + ".java"`,
+  which flows through the existing user-prompt construction and
+  `javaFixer` (so the class is renamed properly), and the response
+  sets **`X-Filename: <Name>.java`** so terminal users know what to
+  save the file as. An explicit user filename always wins.
+- **Prompt rules:** RULE 5 rewritten — the public class must match
+  the provided filename; with no filename it must be named after the
+  problem, never a bare `Main` (unless literally asked for). New
+  RULE 13 for ALL languages: functions/methods are named after the
+  task (`binarySearch`, `is_palindrome`, `fibonacci_series`,
+  `isPalindrome`), never `solve()`/`func()`/`myFunction()`, and
+  `main()` demonstrates usage with a small example.
+- **Tests:** 9 derivation cases + a stub-mode end-to-end test:
+  `GET /api?q=write+binary+search&lang=java` (TEST STUB) returns code
+  containing `public class BinarySearch` and header
+  `X-Filename: BinarySearch.java`. The compile/run harness already
+  used per-problem derived filenames, so it needed no weakening —
+  still 18/18.

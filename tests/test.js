@@ -148,6 +148,42 @@ test("Python indentation is preserved exactly", () => {
   assert(out.includes("\n    return 0"), "4-space indent must survive");
 });
 
+console.log("\n=== Class Name Derivation Tests ===");
+const { deriveClassName } = require("../src/utils/className");
+test("'write binary search' -> BinarySearch", () => {
+  assert.strictEqual(deriveClassName("write binary search"), "BinarySearch");
+});
+test("'binary search in java' -> BinarySearch", () => {
+  assert.strictEqual(deriveClassName("binary search in java"), "BinarySearch");
+});
+test("'check palindrome' -> CheckPalindrome", () => {
+  assert.strictEqual(deriveClassName("check palindrome"), "CheckPalindrome");
+});
+test("'fibonacci series' -> FibonacciSeries", () => {
+  assert.strictEqual(deriveClassName("fibonacci series"), "FibonacciSeries");
+});
+test("'reverse a linked list' -> ReverseLinkedList", () => {
+  assert.strictEqual(deriveClassName("reverse a linked list"), "ReverseLinkedList");
+});
+test("'bubble sort' -> BubbleSort", () => {
+  assert.strictEqual(deriveClassName("bubble sort"), "BubbleSort");
+});
+test("empty prompt -> Solution (never Main)", () => {
+  assert.strictEqual(deriveClassName(""), "Solution");
+  assert.strictEqual(deriveClassName(null), "Solution");
+  assert.strictEqual(deriveClassName("write a program in java"), "Solution");
+});
+test("digit-leading name gets Program prefix", () => {
+  const name = deriveClassName("2 sum problem");
+  assert(!/^\d/.test(name), "must not start with a digit");
+  assert(name.startsWith("Program"), "digit-leading names are prefixed");
+});
+test("derived name is capped and valid", () => {
+  const name = deriveClassName("implement a very efficient algorithm for finding the kth smallest element in an unsorted array quickly");
+  assert(name.length <= 40 + "Program".length, "length capped");
+  assert(/^[A-Z][A-Za-z0-9]*$/.test(name), "valid class identifier");
+});
+
 console.log("\n=== Code Validator Tests ===");
 const { validateCode } = require("../src/utils/codeValidator");
 test("valid C passes", () => {
@@ -314,6 +350,120 @@ console.log(`=============================\n`);
     assert.strictEqual(isModelNotFound({ status: 500 }), false);
   });
 
+  console.log("\n=== Groq Model Fallback Tests (labeled stubs, TEST ONLY) ===");
+  await atest("Groq candidate list defaults to gpt-oss-120b chain", async () => {
+    const { candidateModels } = require("../src/utils/groqClient");
+    delete process.env.MODEL;
+    delete process.env.GROQ_MODELS;
+    assert.deepStrictEqual(candidateModels({}), [
+      "openai/gpt-oss-120b",
+      "openai/gpt-oss-20b",
+      "meta-llama/llama-4-scout-17b-16e-instruct",
+      "qwen/qwen3-32b",
+    ]);
+    process.env.MODEL = "custom/model-x";
+    assert.strictEqual(candidateModels({})[0], "custom/model-x");
+    delete process.env.MODEL;
+  });
+  await atest("Groq: GROQ_MODELS env replaces the fallback list", async () => {
+    const { candidateModels } = require("../src/utils/groqClient");
+    delete process.env.MODEL;
+    process.env.GROQ_MODELS = "custom/one, custom/two";
+    try {
+      assert.deepStrictEqual(candidateModels({}), ["custom/one", "custom/two"]);
+    } finally {
+      delete process.env.GROQ_MODELS;
+    }
+  });
+  await atest("Groq: isModelNotFound only matches 404 model_not_found", async () => {
+    const { isModelNotFound } = require("../src/utils/groqClient");
+    const e404 = new Error("The model `x` does not exist or you do not have access to it.");
+    e404.status = 404;
+    e404.code = "model_not_found";
+    assert.strictEqual(isModelNotFound(e404), true);
+    assert.strictEqual(isModelNotFound({ status: 404, message: "plain not found" }), false);
+    assert.strictEqual(isModelNotFound({ status: 429, code: "model_not_found" }), false);
+    assert.strictEqual(isModelNotFound({ status: 500 }), false);
+  });
+  await atest("Groq: first model model_not_found -> second model answers", async () => {
+    const { callGroqWithRetry } = require("../src/utils/groqClient");
+    delete process.env.MODEL;
+    delete process.env.GROQ_MODELS;
+    const tried = [];
+    // TEST STUB (labeled fake): simulates Groq answering 404
+    // model_not_found for the first candidate and success for the next.
+    const createCompletion = async ({ model }) => {
+      tried.push(model);
+      if (model === "openai/gpt-oss-120b") {
+        const e = new Error(
+          "The model `openai/gpt-oss-120b` does not exist or you do not have access to it."
+        );
+        e.status = 404;
+        e.code = "model_not_found";
+        throw e;
+      }
+      return {
+        choices: [{ message: { content: "code-from-" + model } }],
+        usage: { total_tokens: 1 },
+      };
+    };
+    const r = await callGroqWithRetry(
+      [{ role: "user", content: "x" }],
+      {},
+      3,
+      { createCompletion }
+    );
+    assert.strictEqual(r.model, "openai/gpt-oss-20b");
+    assert.strictEqual(r.content, "code-from-openai/gpt-oss-20b");
+    assert.deepStrictEqual(tried, ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]);
+  });
+  await atest("Groq: non-model error does NOT cycle models", async () => {
+    const { callGroqWithRetry } = require("../src/utils/groqClient");
+    delete process.env.MODEL;
+    delete process.env.GROQ_MODELS;
+    const tried = [];
+    // TEST STUB (labeled fake): a 401 auth error must surface at once.
+    const createCompletion = async ({ model }) => {
+      tried.push(model);
+      const e = new Error("Invalid API Key");
+      e.status = 401;
+      throw e;
+    };
+    await assert.rejects(
+      () => callGroqWithRetry([{ role: "user", content: "x" }], {}, 3, { createCompletion }),
+      (err) => err.status === 401
+    );
+    assert.deepStrictEqual(tried, ["openai/gpt-oss-120b"]);
+  });
+
+  console.log("\n=== Stub-Mode End-to-End Naming Test (TEST ONLY) ===");
+  await atest("GET /api?q=write+binary+search&lang=java -> BinarySearch class + X-Filename (stub mode)", async () => {
+    process.env.CODEAI_TEST_STUB = "1";
+    process.env.PORT = "3217";
+    const { server } = require("../src/server");
+    try {
+      const res = await fetch(
+        "http://127.0.0.1:3217/api?q=" +
+          encodeURIComponent("write binary search") +
+          "&lang=java"
+      );
+      const body = await res.text();
+      assert.strictEqual(res.status, 200, body.slice(0, 200));
+      assert.strictEqual(res.headers.get("x-test-stub"), "1");
+      assert.strictEqual(res.headers.get("x-filename"), "BinarySearch.java");
+      assert(
+        body.includes("public class BinarySearch"),
+        "expected derived class name in code, got: " + body.slice(0, 160)
+      );
+    } finally {
+      delete process.env.CODEAI_TEST_STUB;
+      server.close();
+      if (typeof server.closeAllConnections === "function") {
+        server.closeAllConnections();
+      }
+    }
+  });
+
   console.log("\n=== Semaphore Behavior Tests ===");
   await atest("at most N tasks run concurrently, rest queue", async () => {
     const sem = new Semaphore(2, 5000);
@@ -346,7 +496,9 @@ console.log(`=============================\n`);
   );
   console.log(`=============================\n`);
 
-  if (failed + aFailed > 0) process.exit(1);
+  // Explicit exit: the stub e2e test boots the real server (and its
+  // cache timers) inside this process, so don't rely on a natural exit.
+  process.exit(failed + aFailed > 0 ? 1 : 0);
 })().catch((err) => {
   console.error("Async test runner crashed:", err);
   process.exit(1);

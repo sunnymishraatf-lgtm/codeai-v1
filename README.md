@@ -33,6 +33,13 @@ never a crash or a hung connection.
 | `NVIDIA_API_KEY` | *(one of the two keys is required)* | NVIDIA NIM API key (backup provider) |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (Nemotron — Sunny's requested backup family). **NVIDIA rotates/retires models** — this default was verified working live on 2026-10-20 with a real key (returned correct C code). Fallback chain: `nvidia/nemotron-3-ultra-550b-a55b` → `openai/gpt-oss-20b` (verified, correct Python code) → `google/gemma-4-31b-it` (verified answering). If the chosen model returns 404 or 410, the server automatically tries the next model. The three older NEUTRON-app catalog models currently fail live (410 Gone / 410 Gone / 404) and are no longer in the chain. Set `NVIDIA_MODEL` to override. |
 
+**Groq models rotate too.** `llama-3.3-70b-versatile` was moved to
+enterprise-only pricing in Aug 2026 (free keys get `404
+model_not_found`), so the Groq default is now `openai/gpt-oss-120b`.
+If the chosen Groq model answers `model_not_found`, the server
+automatically tries the next model in the fallback chain (see
+`GROQ_MODELS` below) instead of failing the request.
+
 The response carries an `X-Provider: groq|nvidia` header so you can see
 which provider answered. Generated code is structurally validated
 (C / Java / Python checks) before it is returned; if validation fails,
@@ -47,7 +54,8 @@ final result is reported in the `X-Validation` header.
 | `NVIDIA_API_KEY` | required* | Your NVIDIA NIM API key (backup) |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (see failover section; verified live 2026-10-20) |
 | `PORT` | `3000` | Server port |
-| `MODEL` | `llama-3.3-70b-versatile` | Groq model to use |
+| `MODEL` | `openai/gpt-oss-120b` | Groq model to use. **Do not set `llama-3.3-70b-versatile`**: Groq moved it to enterprise-only pricing in Aug 2026, so free/self-serve keys get `404 model_not_found` (this broke the live deployment on 2026-10-20; `gpt-oss-120b` is the verified fix) |
+| `GROQ_MODELS` | *(built-in list)* | Optional comma-separated Groq fallback list. If the chosen model answers `model_not_found`, the next model is tried automatically. Built-in chain: `openai/gpt-oss-120b` → `openai/gpt-oss-20b` → `meta-llama/llama-4-scout-17b-16e-instruct` → `qwen/qwen3-32b` |
 | `MAX_TOKENS` | `8192` | Max tokens per response |
 | `RATE_LIMIT_MAX` | `1000` | Global requests per window per IP (high on purpose — see Classroom use) |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window (ms) |
@@ -121,6 +129,14 @@ Supported `lang` values include `c`, `java`, `python`, `cpp`,
 `javascript`, and everything the auto-detector knows (aliases like
 `py`, `js`, `c++` work too). If `lang` is omitted, the language is
 detected from the question.
+
+**Naming:** Java answers get a problem-specific class name derived
+from the question — `?q=write+binary+search&lang=java` returns
+`public class BinarySearch`, not a generic `Main`. The response
+carries an `X-Filename: BinarySearch.java` header telling you exactly
+what to save the file as (an explicit `filename` in the request always
+wins). In every language, functions are named after the task
+(`binarySearch`, `is_palindrome`, …), never generic placeholders.
 
 ---
 
@@ -199,7 +215,8 @@ codeai-project/
 │   │   ├── errorHandler.js    # Error + 404 handlers
 │   │   └── validator.js       # Request validation
 │   └── utils/
-│       ├── groqClient.js      # Groq API + retry logic (primary provider)
+│       ├── groqClient.js      # Groq API + retry + model fallback (primary provider)
+│       ├── className.js       # Derives problem-specific Java class names from prompts
 │       ├── nvidiaClient.js    # NVIDIA NIM API + model fallback (backup)
 │       ├── aiProvider.js      # Provider failover: Groq -> NVIDIA
 │       ├── concurrency.js     # AI concurrency semaphore + queue
