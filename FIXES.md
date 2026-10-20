@@ -304,3 +304,46 @@ unset → A→B only with combined error; Plan A healthy → B and C never
 invoked; secondary slot missing-key error names `GROQ_API_KEY_2`;
 per-slot stub counts; health groq2 flag unset/set). `npm test`:
 67 passed, 0 failed. `npm run verify`: 18/18 unchanged.
+
+## F. Sticky failover — one question = one key (2026-10-20)
+
+Sunny's rule: "all the three api keys should not be used together for
+1 question." Previously `aiProvider.js` tried Plan A → Plan B → Plan C
+sequentially *inside one request* until something succeeded, so a
+single bad question could burn calls on all three keys. That behavior
+is replaced (this section supersedes the failover descriptions in
+section B and the Plan C section above):
+
+- **One question = one key.** Each request selects the FIRST
+  configured leg not in cooldown — Groq (A) → NVIDIA (B) → Groq2 (C) —
+  and calls ONLY that leg. Per-model fallback on the same key and the
+  single validation self-repair retry stay on that same leg (audited
+  in `generate.js`: both `callAI` invocations in `runUpstream` go
+  through the same sticky selector; a failing repair does not fall
+  over to another leg).
+- **Circuit breaker per leg.** If the selected leg fails, it is
+  benched and the request returns a typed `PROVIDER_FAILED_COOLDOWN`
+  error (HTTP 502) naming the failed provider, the bench duration, and
+  the plan the NEXT questions will use. The question is not retried on
+  another key.
+- **Cooldowns:** `PROVIDER_COOLDOWN_MS` (default 60000) for general
+  failures; `RATE_LIMIT_COOLDOWN_MS` (default 300000) for 429/quota
+  failures; a provider `Retry-After` hint overrides both (capped at
+  15 min). On success a leg resets to up; on cooldown expiry the leg
+  is eligible again in preference order, so Plan A naturally resumes.
+- **All legs cooling:** HTTP 503 `ALL_PROVIDERS_COOLDOWN` with the
+  earliest retry time — and zero provider calls are made.
+- **Visibility:** `GET /api/health` gains `providerState`
+  (`"up" | "cooldown"` per configured leg; `groq2` omitted when its
+  key is unset). Breaker state is in-memory module state in
+  `aiProvider.js`, shared by all chain instances.
+- `ALL_PROVIDERS_FAILED` no longer exists; the generate route maps
+  the two new typed errors (the all-cooldown 503 branch is matched
+  before the generic queue-503 branch).
+
+Tests: the four tests that encoded the old try-every-leg behavior were
+rewritten to the sticky semantics, and 5 tests added (cooldown expiry
+re-eligibility; 429 → rate-limit cooldown, not the general one;
+Retry-After override + 15-min cap; self-repair stays on the same leg;
+failing repair does not fall over). `npm test`: 72 passed, 0 failed.
+`npm run verify`: 18/18 unchanged.

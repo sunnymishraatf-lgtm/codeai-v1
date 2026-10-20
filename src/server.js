@@ -100,6 +100,8 @@ const server = app.listen(PORT, () => {
     groqKeySet: !!process.env.GROQ_API_KEY,
     nvidiaKeySet: !!process.env.NVIDIA_API_KEY,
     groq2KeySet: !!process.env.GROQ_API_KEY_2,
+    providerLegOrder:
+      "groq (Plan A) -> nvidia (Plan B) -> groq2 (Plan C), sticky failover: one question = one key",
   });
 });
 

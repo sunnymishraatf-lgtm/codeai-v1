@@ -251,7 +251,7 @@ console.log(`=============================\n`);
     }
   }
 
-  console.log("=== Provider Failover Tests (stubbed providers, TEST ONLY) ===");
+  console.log("=== Provider Failover / Sticky Tests (stubbed providers, TEST ONLY) ===");
   await atest("Groq success -> provider=groq, NVIDIA untouched", async () => {
     let nvidiaCalled = false;
     const chain = createProviderChain({
@@ -268,7 +268,8 @@ console.log(`=============================\n`);
     assert.strictEqual(r.provider, "groq");
     assert.strictEqual(nvidiaCalled, false);
   });
-  await atest("Groq throws -> NVIDIA stub answers, provider=nvidia", async () => {
+  await atest("Sticky: Groq fails Q1 -> Q1 errors (PROVIDER_FAILED_COOLDOWN), NVIDIA NOT called; Q2 served by NVIDIA only", async () => {
+    let nvidiaCalls = 0;
     const chain = createProviderChain({
       groqConfigured: () => true,
       nvidiaConfigured: () => true,
@@ -278,11 +279,31 @@ console.log(`=============================\n`);
         e.status = 503;
         throw e;
       },
-      nvidiaCall: async () => ({ content: "nv code", usage: {}, model: "nv" }),
+      nvidiaCall: async () => {
+        nvidiaCalls++;
+        return { content: "nv code", usage: {}, model: "nv" };
+      },
     });
+    chain.resetState();
+    // Q1: only Plan A is called; its failure errors THIS question and
+    // benches Plan A. One question = one key.
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) =>
+        err.code === "PROVIDER_FAILED_COOLDOWN" &&
+        err.provider === "groq" &&
+        err.nextProvider === "nvidia" &&
+        err.message.includes("groq down")
+    );
+    assert.strictEqual(nvidiaCalls, 0);
+    assert.strictEqual(chain.getProviderState().groq, "cooldown");
+    assert.strictEqual(chain.getProviderState().nvidia, "up");
+    // Q2: Plan A is benched, so Plan B serves — alone.
     const r = await chain.callAI([], {});
     assert.strictEqual(r.provider, "nvidia");
     assert.strictEqual(r.content, "nv code");
+    assert.strictEqual(nvidiaCalls, 1);
+    chain.resetState();
   });
   await atest("Groq missing, NVIDIA configured -> NVIDIA used directly", async () => {
     const chain = createProviderChain({
@@ -297,25 +318,48 @@ console.log(`=============================\n`);
     const r = await chain.callAI([], {});
     assert.strictEqual(r.provider, "nvidia");
   });
-  await atest("both providers throw -> ALL_PROVIDERS_FAILED with both reasons", async () => {
+  await atest("Sticky: both legs fail on successive questions -> third question gets ALL_PROVIDERS_COOLDOWN (503) with zero provider calls", async () => {
+    let groqCalls = 0;
+    let nvidiaCalls = 0;
     const chain = createProviderChain({
       groqConfigured: () => true,
       nvidiaConfigured: () => true,
       stubMode: () => false,
       groqCall: async () => {
+        groqCalls++;
         throw new Error("groq boom");
       },
       nvidiaCall: async () => {
+        nvidiaCalls++;
         throw new Error("nvidia boom");
       },
     });
+    chain.resetState();
     await assert.rejects(
       () => chain.callAI([], {}),
       (err) =>
-        err.code === "ALL_PROVIDERS_FAILED" &&
-        err.message.includes("groq boom") &&
+        err.code === "PROVIDER_FAILED_COOLDOWN" &&
+        err.provider === "groq" &&
+        err.message.includes("groq boom")
+    );
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) =>
+        err.code === "PROVIDER_FAILED_COOLDOWN" &&
+        err.provider === "nvidia" &&
         err.message.includes("nvidia boom")
     );
+    const callsBefore = groqCalls + nvidiaCalls;
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) =>
+        err.code === "ALL_PROVIDERS_COOLDOWN" &&
+        err.status === 503 &&
+        typeof err.retryAt === "string"
+    );
+    // The all-cooldown rejection must not have called any provider.
+    assert.strictEqual(groqCalls + nvidiaCalls, callsBefore);
+    chain.resetState();
   });
   await atest("no providers configured -> MISSING_API_KEY", async () => {
     const chain = createProviderChain({
@@ -351,27 +395,51 @@ console.log(`=============================\n`);
   });
 
   console.log("\n=== Plan C Tests (second Groq key, stubbed providers, TEST ONLY) ===");
-  await atest("Plan C: Groq A throws + NVIDIA throws + Groq second key answers -> provider=groq2", async () => {
+  await atest("Plan C sticky: A fails Q1, B fails Q2, C answers Q3 (exactly one key per question)", async () => {
+    let aCalls = 0;
+    let bCalls = 0;
+    let cCalls = 0;
     const chain = createProviderChain({
       groqConfigured: () => true,
       nvidiaConfigured: () => true,
       groq2Configured: () => true,
       stubMode: () => false,
       groqCall: async () => {
+        aCalls++;
         const e = new Error("groq A rate limited");
         e.status = 429;
         throw e;
       },
       nvidiaCall: async () => {
+        bCalls++;
         throw new Error("nvidia boom");
       },
-      groq2Call: async () => ({ content: "plan-c code", usage: {}, model: "g2" }),
+      groq2Call: async () => {
+        cCalls++;
+        return { content: "plan-c code", usage: {}, model: "g2" };
+      },
     });
+    chain.resetState();
+    // Q1: only A is tried; it fails and is benched. B and C untouched.
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) => err.code === "PROVIDER_FAILED_COOLDOWN" && err.provider === "groq"
+    );
+    assert.deepStrictEqual([aCalls, bCalls, cCalls], [1, 0, 0]);
+    // Q2: only B is tried (A benched); it fails and is benched. C untouched.
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) => err.code === "PROVIDER_FAILED_COOLDOWN" && err.provider === "nvidia"
+    );
+    assert.deepStrictEqual([aCalls, bCalls, cCalls], [1, 1, 0]);
+    // Q3: only C remains eligible and serves the question.
     const r = await chain.callAI([], {});
     assert.strictEqual(r.provider, "groq2");
     assert.strictEqual(r.content, "plan-c code");
+    assert.deepStrictEqual([aCalls, bCalls, cCalls], [1, 1, 1]);
+    chain.resetState();
   });
-  await atest("Plan C unset -> chain stays A->B only, combined error lists both legs", async () => {
+  await atest("Plan C unset -> legs A->B only; each failure benches its leg, then ALL_PROVIDERS_COOLDOWN; C never called", async () => {
     let groq2Called = false;
     const chain = createProviderChain({
       groqConfigured: () => true,
@@ -389,14 +457,27 @@ console.log(`=============================\n`);
         return { content: "must not happen", usage: {}, model: "g2" };
       },
     });
+    chain.resetState();
     await assert.rejects(
       () => chain.callAI([], {}),
       (err) =>
-        err.code === "ALL_PROVIDERS_FAILED" &&
-        err.message.includes("groq boom") &&
+        err.code === "PROVIDER_FAILED_COOLDOWN" &&
+        err.provider === "groq" &&
+        err.message.includes("groq boom")
+    );
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) =>
+        err.code === "PROVIDER_FAILED_COOLDOWN" &&
+        err.provider === "nvidia" &&
         err.message.includes("nvidia boom")
     );
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) => err.code === "ALL_PROVIDERS_COOLDOWN"
+    );
     assert.strictEqual(groq2Called, false);
+    chain.resetState();
   });
   await atest("Plan A healthy -> NVIDIA and Plan C never invoked", async () => {
     let nvidiaCalls = 0;
@@ -445,26 +526,241 @@ console.log(`=============================\n`);
       delete process.env.CODEAI_TEST_STUB;
     }
   });
-  await atest("health providers include groq2 (false when unset, true when set)", async () => {
+  await atest("health providers include groq2 + providerState (up -> cooldown after a failure)", async () => {
     const express = require("express");
     const adminRoute = require("../src/routes/admin");
+    const {
+      createProviderChain: makeChain,
+      resetProviderState,
+    } = require("../src/utils/aiProvider");
     const app = express();
     app.use("/api", adminRoute);
     const srv = app.listen(0);
     try {
       const base = `http://127.0.0.1:${srv.address().port}/api/health`;
+      resetProviderState();
       delete process.env.GROQ_API_KEY_2;
       let body = await (await fetch(base)).json();
       assert.strictEqual(body.providers.groq2, false);
       assert.strictEqual(body.groq2KeyConfigured, false);
+      // With Plan A/B keys present, both legs report "up"; the
+      // unconfigured groq2 leg is omitted from providerState.
+      process.env.GROQ_API_KEY = "test-only-not-a-real-key";
+      process.env.NVIDIA_API_KEY = "test-only-not-a-real-key";
+      body = await (await fetch(base)).json();
+      assert.strictEqual(body.providerState.groq, "up");
+      assert.strictEqual(body.providerState.nvidia, "up");
+      assert.strictEqual("groq2" in body.providerState, false);
       process.env.GROQ_API_KEY_2 = "test-only-not-a-real-key";
       body = await (await fetch(base)).json();
       assert.strictEqual(body.providers.groq2, true);
       assert.strictEqual(body.groq2KeyConfigured, true);
+      assert.strictEqual(body.providerState.groq2, "up");
+      // A failure recorded on the shared circuit breaker (via a
+      // stubbed chain instance, TEST ONLY) is visible in health.
+      const chain = makeChain({
+        groqConfigured: () => true,
+        nvidiaConfigured: () => true,
+        groq2Configured: () => true,
+        stubMode: () => false,
+        groqCall: async () => {
+          throw new Error("health-test groq failure");
+        },
+        nvidiaCall: async () => ({ content: "n", usage: {}, model: "n" }),
+        groq2Call: async () => ({ content: "c", usage: {}, model: "c" }),
+      });
+      await assert.rejects(() => chain.callAI([], {}));
+      body = await (await fetch(base)).json();
+      assert.strictEqual(body.providerState.groq, "cooldown");
+      assert.strictEqual(body.providerState.nvidia, "up");
+      assert.strictEqual(body.providerState.groq2, "up");
     } finally {
+      resetProviderState();
+      delete process.env.GROQ_API_KEY;
+      delete process.env.NVIDIA_API_KEY;
       delete process.env.GROQ_API_KEY_2;
       srv.close();
     }
+  });
+
+  console.log("\n=== Sticky Failover Behaviour Tests (one question = one key, TEST ONLY) ===");
+  await atest("Sticky: cooldown expiry makes Plan A eligible again and it serves the next question", async () => {
+    process.env.PROVIDER_COOLDOWN_MS = "40";
+    let groqBehavior = "fail";
+    let groqCalls = 0;
+    let nvidiaCalls = 0;
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      stubMode: () => false,
+      groqCall: async () => {
+        groqCalls++;
+        if (groqBehavior === "fail") throw new Error("groq down");
+        return { content: "a code", usage: {}, model: "g" };
+      },
+      nvidiaCall: async () => {
+        nvidiaCalls++;
+        return { content: "b code", usage: {}, model: "n" };
+      },
+    });
+    chain.resetState();
+    try {
+      await assert.rejects(
+        () => chain.callAI([], {}),
+        (err) => err.code === "PROVIDER_FAILED_COOLDOWN"
+      );
+      const rB = await chain.callAI([], {}); // A benched -> B serves
+      assert.strictEqual(rB.provider, "nvidia");
+      await new Promise((r) => setTimeout(r, 90)); // let the 40ms cooldown lapse
+      groqBehavior = "ok";
+      const rA = await chain.callAI([], {}); // A eligible again -> A serves
+      assert.strictEqual(rA.provider, "groq");
+      assert.strictEqual(rA.content, "a code");
+      assert.deepStrictEqual([groqCalls, nvidiaCalls], [2, 1]);
+      assert.strictEqual(chain.getProviderState().groq, "up");
+    } finally {
+      delete process.env.PROVIDER_COOLDOWN_MS;
+      chain.resetState();
+    }
+  });
+  await atest("Sticky: 429/quota failure benches for RATE_LIMIT_COOLDOWN_MS, not the general cooldown", async () => {
+    process.env.PROVIDER_COOLDOWN_MS = "30";
+    process.env.RATE_LIMIT_COOLDOWN_MS = "60000";
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => false,
+      groq2Configured: () => false,
+      stubMode: () => false,
+      groqCall: async () => {
+        const e = new Error("rate limit reached for this key");
+        e.status = 429;
+        throw e;
+      },
+      nvidiaCall: async () => ({}),
+      groq2Call: async () => ({}),
+    });
+    chain.resetState();
+    try {
+      await assert.rejects(
+        () => chain.callAI([], {}),
+        (err) =>
+          err.code === "PROVIDER_FAILED_COOLDOWN" && err.cooldownMs === 60000
+      );
+      await new Promise((r) => setTimeout(r, 80)); // past the 30ms general cooldown
+      // Still benched: the rate-limit cooldown (60s) was applied.
+      assert.strictEqual(chain.getProviderState().groq, "cooldown");
+    } finally {
+      delete process.env.PROVIDER_COOLDOWN_MS;
+      delete process.env.RATE_LIMIT_COOLDOWN_MS;
+      chain.resetState();
+    }
+  });
+  await atest("Sticky: provider retry-after hint overrides the cooldown (capped at 15 min)", async () => {
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => false,
+      groq2Configured: () => false,
+      stubMode: () => false,
+      groqCall: async () => {
+        const e = new Error("slow down");
+        e.status = 429;
+        e.retryAfterSeconds = 120;
+        throw e;
+      },
+      nvidiaCall: async () => ({}),
+      groq2Call: async () => ({}),
+    });
+    chain.resetState();
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) => err.cooldownMs === 120000
+    );
+    // An absurd hint is capped at 15 minutes.
+    const chain2 = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => false,
+      groq2Configured: () => false,
+      stubMode: () => false,
+      groqCall: async () => {
+        const e = new Error("slow down");
+        e.retryAfterSeconds = 99999;
+        throw e;
+      },
+      nvidiaCall: async () => ({}),
+      groq2Call: async () => ({}),
+    });
+    chain2.resetState();
+    await assert.rejects(
+      () => chain2.callAI([], {}),
+      (err) => err.cooldownMs === 15 * 60 * 1000
+    );
+    chain2.resetState();
+  });
+  await atest("Sticky: validation self-repair retry stays on the same leg (initial + repair both via Plan A)", async () => {
+    // generate.js calls callAI twice for a question whose code fails
+    // validation (initial attempt + ONE repair). Both calls must use
+    // the same leg — B/C counts prove no leg switch happens.
+    let aCalls = 0;
+    let bCalls = 0;
+    let cCalls = 0;
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      groq2Configured: () => true,
+      stubMode: () => false,
+      groqCall: async () => {
+        aCalls++;
+        return { content: "code attempt " + aCalls, usage: {}, model: "g" };
+      },
+      nvidiaCall: async () => {
+        bCalls++;
+        return { content: "b", usage: {}, model: "n" };
+      },
+      groq2Call: async () => {
+        cCalls++;
+        return { content: "c", usage: {}, model: "g2" };
+      },
+    });
+    chain.resetState();
+    const first = await chain.callAI([], {});
+    const repair = await chain.callAI([], {});
+    assert.strictEqual(first.provider, "groq");
+    assert.strictEqual(repair.provider, "groq");
+    assert.deepStrictEqual([aCalls, bCalls, cCalls], [2, 0, 0]);
+    chain.resetState();
+  });
+  await atest("Sticky: a failing self-repair attempt does NOT fall over to Plan B/C", async () => {
+    let aCalls = 0;
+    let bCalls = 0;
+    let cCalls = 0;
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      groq2Configured: () => true,
+      stubMode: () => false,
+      groqCall: async () => {
+        aCalls++;
+        if (aCalls === 1) return { content: "first code", usage: {}, model: "g" };
+        throw new Error("repair attempt exploded");
+      },
+      nvidiaCall: async () => {
+        bCalls++;
+        return { content: "b", usage: {}, model: "n" };
+      },
+      groq2Call: async () => {
+        cCalls++;
+        return { content: "c", usage: {}, model: "g2" };
+      },
+    });
+    chain.resetState();
+    const first = await chain.callAI([], {});
+    assert.strictEqual(first.provider, "groq");
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) => err.code === "PROVIDER_FAILED_COOLDOWN" && err.provider === "groq"
+    );
+    assert.deepStrictEqual([bCalls, cCalls], [0, 0]);
+    chain.resetState();
   });
 
   console.log("\n=== Groq Model Fallback Tests (labeled stubs, TEST ONLY) ===");

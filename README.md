@@ -20,30 +20,51 @@ npm start          # production
 npm run dev        # development (auto-reload)
 ```
 
-## AI Providers (failover)
+## AI Providers (sticky failover — one question = one key)
 
-Requests are served by a three-leg failover chain — if a leg is not
-configured, fails, rate-limits, or times out, the next one is tried
-automatically. If every configured leg fails, the client gets an honest
-combined error — never a crash or a hung connection.
+Requests are served by three provider legs in preference order, but
+**one question uses exactly one key**. Each request selects the first
+configured leg that is not in cooldown and calls ONLY that leg:
 
 ```
 Plan A: Groq, primary key    (GROQ_API_KEY)
-          │  on any failure (incl. Plan A hitting its usage limit)
-          ▼
 Plan B: NVIDIA NIM           (NVIDIA_API_KEY)
-          │  on any failure
-          ▼
-Plan C: Groq, second key     (GROQ_API_KEY_2) — optional; a separate
-        Groq key kept in reserve so a second usage-limit pool exists
-        after both Plan A and Plan B are exhausted. Skipped when unset.
+Plan C: Groq, second key     (GROQ_API_KEY_2) — optional; skipped when unset
 ```
+
+**Sticky failover (circuit breaker per leg):** if the selected leg's
+call fails, that leg is *benched* for a cooldown and the request
+returns an honest `502` error — the question is **not** silently
+retried on the next key, so one bad question can never burn calls on
+all three keys. The *next* questions automatically select the next
+eligible leg in preference order. When a cooldown expires, the leg
+becomes eligible again — Plan A naturally resumes once it is healthy
+(and is re-benched if it fails again). A leg's internal per-model
+fallback (same key, different model) and the single validation
+self-repair retry stay on the same leg: models are not keys.
+
+If **every** configured leg is in cooldown, requests fail fast with
+`503` (plus the earliest retry time) and no provider is called at all.
+
+| Cooldown | Default | Applies when |
+|---|---|---|
+| `PROVIDER_COOLDOWN_MS` | `60000` (1 min) | General provider failures |
+| `RATE_LIMIT_COOLDOWN_MS` | `300000` (5 min) | HTTP 429 / quota / daily-limit failures |
+
+A provider-supplied `Retry-After` hint overrides both when present
+(capped at 15 minutes). Breaker state is in-memory and visible at
+`GET /api/health` as `providerState: { groq: "up"|"cooldown", ... }`
+(the `groq2` entry appears only when Plan C is configured).
+
+**The honest tradeoff:** the one question that discovers a dead key
+gets an error (telling the student to ask again); every question after
+it is silently served by the next plan until the benched key recovers.
 
 | Variable | Default | Description |
 |---|---|---|
 | `GROQ_API_KEY` | *(at least one provider key is required)* | Groq API key — Plan A (primary provider) |
 | `NVIDIA_API_KEY` | *(at least one provider key is required)* | NVIDIA NIM API key — Plan B (backup provider) |
-| `GROQ_API_KEY_2` | *(optional)* | Second Groq API key — Plan C (reserve; used only after Plan A and Plan B both fail) |
+| `GROQ_API_KEY_2` | *(optional)* | Second Groq API key — Plan C (reserve leg; serves questions once Plan A and Plan B are benched) |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (Nemotron — Sunny's requested backup family). **NVIDIA rotates/retires models** — this default was verified working live on 2026-10-20 with a real key (returned correct C code). Fallback chain: `nvidia/nemotron-3-ultra-550b-a55b` → `openai/gpt-oss-20b` (verified, correct Python code) → `google/gemma-4-31b-it` (verified answering). If the chosen model returns 404 or 410, the server automatically tries the next model. The three older NEUTRON-app catalog models currently fail live (410 Gone / 410 Gone / 404) and are no longer in the chain. Set `NVIDIA_MODEL` to override. |
 
 **Groq models rotate too.** `llama-3.3-70b-versatile` was moved to
@@ -65,7 +86,9 @@ final result is reported in the `X-Validation` header.
 |---|---|---|
 | `GROQ_API_KEY` | required* | Your Groq API key — Plan A (primary) |
 | `NVIDIA_API_KEY` | required* | Your NVIDIA NIM API key — Plan B (backup) |
-| `GROQ_API_KEY_2` | *(none)* | Optional second Groq API key — Plan C (reserve; only used after Plan A and Plan B both fail, e.g. Plan A's key hit its limit) |
+| `GROQ_API_KEY_2` | *(none)* | Optional second Groq API key — Plan C (reserve leg; used for the questions that follow a Plan A + Plan B benching, e.g. Plan A's key hit its limit) |
+| `PROVIDER_COOLDOWN_MS` | `60000` | How long a failed provider leg stays benched (general failures) |
+| `RATE_LIMIT_COOLDOWN_MS` | `300000` | How long a rate-limited (429/quota) provider leg stays benched |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (see failover section; verified live 2026-10-20) |
 | `PORT` | `3000` | Server port |
 | `MODEL` | `openai/gpt-oss-120b` | Groq model to use. **Do not set `llama-3.3-70b-versatile`**: Groq moved it to enterprise-only pricing in Aug 2026, so free/self-serve keys get `404 model_not_found` (this broke the live deployment on 2026-10-20; `gpt-oss-120b` is the verified fix) |
@@ -232,7 +255,7 @@ codeai-project/
 │       ├── groqClient.js      # Groq API + retry + model fallback (primary provider)
 │       ├── className.js       # Derives problem-specific Java class names from prompts
 │       ├── nvidiaClient.js    # NVIDIA NIM API + model fallback (backup)
-│       ├── aiProvider.js      # Provider failover: Groq (A) -> NVIDIA (B) -> Groq 2nd key (C)
+│       ├── aiProvider.js      # Sticky failover (one question = one key): Groq (A) -> NVIDIA (B) -> Groq 2nd key (C)
 │       ├── concurrency.js     # AI concurrency semaphore + queue
 │       ├── codeValidator.js   # Structural validation of generated code
 │       ├── systemPrompt.js    # AI system prompt

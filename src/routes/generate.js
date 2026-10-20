@@ -306,13 +306,35 @@ async function generateCode(req, res) {
       });
     }
 
-    if (err?.code === "ALL_PROVIDERS_FAILED") {
+    // Sticky failover (one question = one key): the single provider
+    // serving this question failed and has been benched; the question
+    // was NOT retried on the other keys. The next questions will be
+    // served by the next plan automatically.
+    if (err?.code === "PROVIDER_FAILED_COOLDOWN") {
       return res.status(502).json({
         error:
-          "Code generation failed on all configured AI providers " +
-          "(Plan A: Groq, Plan B: NVIDIA, Plan C: Groq second key). " +
-          "Please try again shortly.",
+          "The AI provider serving this question failed " +
+          "(Plan A: Groq, Plan B: NVIDIA, Plan C: Groq second key — " +
+          "one question uses one key, so it was not retried on " +
+          "another key). That provider has been benched briefly and " +
+          "the next questions will automatically use the next plan. " +
+          "Please ask again.",
         detail: err.message,
+        provider: err.provider,
+        nextProvider: err.nextProvider,
+        requestId,
+      });
+    }
+
+    // Every configured provider is in cooldown: no provider was
+    // called for this request at all.
+    if (err?.code === "ALL_PROVIDERS_COOLDOWN") {
+      return res.status(503).json({
+        error:
+          "All AI providers are cooling down after recent failures. " +
+          "Please try again in a few moments.",
+        detail: err.message,
+        retryAt: err.retryAt,
         requestId,
       });
     }

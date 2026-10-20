@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { getCacheStats, flushCache } = require("../utils/cache");
 const { apiKeyAuth } = require("../middleware/auth");
-const { configuredProviders } = require("../utils/aiProvider");
+const { configuredProviders, providerState } = require("../utils/aiProvider");
 const os = require("os");
 
 router.get("/health", (req, res) => {
@@ -17,6 +17,9 @@ router.get("/health", (req, res) => {
     nvidiaKeyConfigured: providers.nvidia,
     groq2KeyConfigured: providers.groq2,
     providers,
+    // Sticky-failover circuit breakers: "up" | "cooldown" per
+    // configured leg (groq2 omitted when its key is not set).
+    providerState: providerState(),
   });
 });
 
