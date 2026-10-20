@@ -20,18 +20,65 @@ npm start          # production
 npm run dev        # development (auto-reload)
 ```
 
+## AI Providers (failover)
+
+Requests are served by **Groq (primary)**. If Groq is not configured,
+fails, rate-limits, or times out, the server automatically falls back to
+**NVIDIA NIM (backup)**. If both fail, the client gets an honest error —
+never a crash or a hung connection.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | *(one of the two keys is required)* | Groq API key (primary provider) |
+| `NVIDIA_API_KEY` | *(one of the two keys is required)* | NVIDIA NIM API key (backup provider) |
+| `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (Nemotron — Sunny's requested backup family). **NVIDIA rotates/retires models** — this default was verified working live on 2026-10-20 with a real key (returned correct C code). Fallback chain: `nvidia/nemotron-3-ultra-550b-a55b` → `openai/gpt-oss-20b` (verified, correct Python code) → `google/gemma-4-31b-it` (verified answering). If the chosen model returns 404 or 410, the server automatically tries the next model. The three older NEUTRON-app catalog models currently fail live (410 Gone / 410 Gone / 404) and are no longer in the chain. Set `NVIDIA_MODEL` to override. |
+
+The response carries an `X-Provider: groq|nvidia` header so you can see
+which provider answered. Generated code is structurally validated
+(C / Java / Python checks) before it is returned; if validation fails,
+the provider gets one self-repair retry with the problem fed back. The
+final result is reported in the `X-Validation` header.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROQ_API_KEY` | required | Your Groq API key |
+| `GROQ_API_KEY` | required* | Your Groq API key (primary) |
+| `NVIDIA_API_KEY` | required* | Your NVIDIA NIM API key (backup) |
+| `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (see failover section; verified live 2026-10-20) |
 | `PORT` | `3000` | Server port |
-| `MODEL` | `llama3-70b-8192` | Groq model to use |
-| `MAX_TOKENS` | `4096` | Max tokens per response |
-| `RATE_LIMIT_MAX` | `30` | Requests per window |
+| `MODEL` | `llama-3.3-70b-versatile` | Groq model to use |
+| `MAX_TOKENS` | `8192` | Max tokens per response |
+| `RATE_LIMIT_MAX` | `1000` | Global requests per window per IP (high on purpose — see Classroom use) |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window (ms) |
+| `GENERATE_RATE_LIMIT` | `500` | Generate requests per minute per IP |
+| `MAX_CONCURRENT_AI` | `10` | Max simultaneous AI provider requests; extras queue |
+| `QUEUE_TIMEOUT_MS` | `30000` | Max queue wait before a friendly HTTP 503 |
 | `CACHE_TTL` | `3600` | Cache TTL in seconds |
 | `API_SECRET_KEY` | *(none)* | Optional API key for auth |
+
+\* At least one provider key must be set, or generation returns a clear
+"server is not configured" error.
+
+## Classroom use
+
+This API is built to survive a whole class using it at once (50+
+concurrent students):
+
+- **Shared IP:** students on college Wi-Fi sit behind one NAT address,
+  so per-IP rate limits are set high (1000/min global, 500/min
+  generate). A low per-IP limit would block the entire class after a
+  few questions.
+- **Concurrency cap:** at most `MAX_CONCURRENT_AI` (default 10) AI
+  requests run at once; the rest queue for up to `QUEUE_TIMEOUT_MS`
+  (default 30s) and then get a friendly HTTP 503 instead of hanging.
+- **Cache + request coalescing:** identical question+language requests
+  are cached for an hour, and if 30 students ask the same question at
+  the same moment, they share **one** provider call.
+- **Honest bottleneck:** the real ceiling is the AI provider's own
+  limits (e.g. Groq free-tier requests/tokens per minute). Caching and
+  coalescing stretch it a long way; a paid Groq tier (or the NVIDIA
+  backup) is the upgrade path when a class outgrows the free tier.
 
 ## API Endpoints
 
@@ -57,6 +104,23 @@ Generate code via GET.
 ```
 GET /generate?q=binary+search+in+python
 ```
+
+---
+
+### `GET /api?q=<prompt>&lang=<language>`
+Terminal-friendly GET endpoint — the question and language go straight
+in the URL and the answer comes back as plain-text code:
+
+```bash
+curl "https://<your-site>/api?q=write+binary+search&lang=java"
+curl "https://<your-site>/api?q=fibonacci&lang=c"
+curl "https://<your-site>/api?q=reverse+a+string&lang=python" > reverse.py
+```
+
+Supported `lang` values include `c`, `java`, `python`, `cpp`,
+`javascript`, and everything the auto-detector knows (aliases like
+`py`, `js`, `c++` work too). If `lang` is omitted, the language is
+detected from the question.
 
 ---
 
@@ -107,8 +171,19 @@ Java, Python, C++, C, JavaScript, TypeScript, Go, Rust, Ruby, PHP, C#, Swift, Ko
 ## Running Tests
 
 ```bash
-npm test
+npm test        # unit tests: detection, cleaning, validation,
+                # provider failover (stubbed), concurrency semaphore
+npm run verify  # compile/run verification: 6 classic problems x
+                # C / Java / Python are pushed through the app's own
+                # cleaning+validation pipeline (from labeled messy
+                # fixtures) and then really compiled with gcc / javac
+                # and run with python3 / java; stdout is asserted.
+                # Java cases SKIP loudly if javac is not installed.
 ```
+
+Note: this README intentionally shows no sample AI outputs — outputs
+depend on the live provider. The canonical, verified example solutions
+live in `tests/compile-check.js` and are proven by `npm run verify`.
 
 ## Project Structure
 
@@ -124,14 +199,19 @@ codeai-project/
 │   │   ├── errorHandler.js    # Error + 404 handlers
 │   │   └── validator.js       # Request validation
 │   └── utils/
-│       ├── groqClient.js      # Groq API + retry logic
+│       ├── groqClient.js      # Groq API + retry logic (primary provider)
+│       ├── nvidiaClient.js    # NVIDIA NIM API + model fallback (backup)
+│       ├── aiProvider.js      # Provider failover: Groq -> NVIDIA
+│       ├── concurrency.js     # AI concurrency semaphore + queue
+│       ├── codeValidator.js   # Structural validation of generated code
 │       ├── systemPrompt.js    # AI system prompt
 │       ├── langDetect.js      # Language auto-detection
 │       ├── cache.js           # In-memory response cache
 │       ├── codeCleaner.js     # Strip markdown/preamble
 │       └── logger.js          # JSON structured logger
 ├── tests/
-│   └── test.js                # Unit tests
+│   ├── test.js                # Unit tests
+│   └── compile-check.js       # Compile/run verification (npm run verify)
 ├── .env.example
 ├── .gitignore
 ├── package.json

@@ -10,8 +10,13 @@ router.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
     env: process.env.NODE_ENV || "development",
-    model: process.env.MODEL || "llama3-70b-8192",
+    model: process.env.MODEL || "llama-3.3-70b-versatile",
     groqKeyConfigured: !!process.env.GROQ_API_KEY,
+    nvidiaKeyConfigured: !!process.env.NVIDIA_API_KEY,
+    providers: {
+      groq: !!process.env.GROQ_API_KEY,
+      nvidia: !!process.env.NVIDIA_API_KEY,
+    },
   });
 });
 

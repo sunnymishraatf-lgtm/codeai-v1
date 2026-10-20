@@ -124,6 +124,22 @@ RULE 9 - MINIMAL OUTPUT:
 RULE 10 - COPY-PASTE READY:
 Generated code must work immediately after paste.
 
+RULE 11 - C SPECIFICS:
+When generating C code:
+- Standard C (C11), must compile with: gcc -std=c11
+- Include only the headers actually needed (stdio.h, stdlib.h, string.h, stdbool.h, math.h as appropriate)
+- Exactly one main function, returning int, with return 0 on success
+- No C++ features (no classes, no references, no cout/cin, no new/delete)
+- Use standard library functions whenever possible
+
+RULE 12 - PYTHON SPECIFICS:
+When generating Python code:
+- Clean, idiomatic Python 3
+- Do NOT force the solution into a class unless the problem explicitly asks for one
+- Prefer plain functions and the standard library
+- Correct 4-space indentation, never mix tabs and spaces
+- A short driver under if __name__ == "__main__": is allowed when it makes the code run immediately
+
 OUTPUT FORMAT:
 [pure executable code only]
 `;

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: codeai-v1
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Set these two in the Render dashboard when creating the service
+      # (Blueprint prompts for sync:false values). Never commit real keys.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b

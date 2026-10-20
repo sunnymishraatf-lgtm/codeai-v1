@@ -36,24 +36,42 @@ const EXTENSION_MAP = {
   ".vhdl": "vhdl",
 };
 
+// Language detection rules.
+//
+// Ordering and matching style matter here:
+// - Symbolic tokens (c++, c#, .cpp, .cs, file extensions) are matched as
+//   substrings because they are unambiguous.
+// - Word tokens are matched with \b word boundaries. Plain substring
+//   matching was a bug: "javascript" contains "java", so every JavaScript
+//   prompt was misdetected as Java, and there was no rule at all for
+//   plain C, so "binary search in c" fell through to "auto".
+// - The plain-C rule runs AFTER cpp and csharp so "c++"/"c#" win first,
+//   and \bc\b cannot match inside "c++" (the char after "c" is "+",
+//   which is handled by the earlier cpp substring rule anyway).
 const KEYWORD_MAP = [
-  { keywords: ["java", ".java", "wap in java", "write a program in java", "in java"], lang: "java" },
-  { keywords: ["python", ".py", "wap in python", "write in python", "django", "flask", "numpy", "pandas", "in python"], lang: "python" },
-  { keywords: ["c++", "cpp", ".cpp", "wap in c++", "write in c++", "in c++"], lang: "cpp" },
-  { keywords: ["c#", "csharp", ".cs", "dotnet", ".net"], lang: "csharp" },
-  { keywords: ["javascript", "node", "nodejs", "express", ".js", "react", "vue", "next"], lang: "javascript" },
-  { keywords: ["typescript", ".ts", "angular"], lang: "typescript" },
-  { keywords: ["golang", ".go"], lang: "go" },
-  { keywords: ["rust", ".rs", "cargo"], lang: "rust" },
-  { keywords: ["sql", "mysql", "postgres", "sqlite", "database query"], lang: "sql" },
-  { keywords: ["html", "css", "webpage", "landing page", "web page"], lang: "html" },
-  { keywords: ["bash", "shell", "linux command", ".sh"], lang: "bash" },
-  { keywords: ["swift", "ios", "xcode"], lang: "swift" },
-  { keywords: ["kotlin", "android"], lang: "kotlin" },
-  { keywords: ["ruby", ".rb", "rails"], lang: "ruby" },
-  { keywords: ["php", ".php", "laravel"], lang: "php" },
-  { keywords: ["vhdl", ".vhd", "entity", "architecture", "signal", "process", "fpga", "hdl"], lang: "vhdl" },
+  { substrings: [".java"], words: ["java"], lang: "java" },
+  { substrings: [".py", "django", "flask", "numpy", "pandas"], words: ["python", "python3"], lang: "python" },
+  { substrings: ["c++", ".cpp"], words: ["cpp"], lang: "cpp" },
+  { substrings: ["c#", ".cs", "dotnet", ".net"], words: ["csharp"], lang: "csharp" },
+  { substrings: [".js", "nodejs"], words: ["javascript", "node", "express", "react", "vue", "next"], lang: "javascript" },
+  { substrings: [".ts"], words: ["typescript", "angular"], lang: "typescript" },
+  { substrings: [".go"], words: ["golang"], lang: "go" },
+  { substrings: [".rs", "cargo"], words: ["rust"], lang: "rust" },
+  { substrings: [], words: ["sql", "mysql", "postgres", "sqlite", "database query"], lang: "sql" },
+  { substrings: [], words: ["html", "css", "webpage", "landing page", "web page"], lang: "html" },
+  { substrings: [".sh"], words: ["bash", "shell", "linux command"], lang: "bash" },
+  { substrings: [], words: ["swift", "ios", "xcode"], lang: "swift" },
+  { substrings: [], words: ["kotlin", "android"], lang: "kotlin" },
+  { substrings: [".rb"], words: ["ruby", "rails"], lang: "ruby" },
+  { substrings: [".php"], words: ["php", "laravel"], lang: "php" },
+  { substrings: [".vhd"], words: ["vhdl", "entity", "architecture", "signal", "process", "fpga", "hdl"], lang: "vhdl" },
+  // Plain C LAST among the C family: only reached when c++/c# did not match.
+  { substrings: [".c"], words: ["c"], lang: "c" },
 ];
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function detectLanguage(prompt, filename) {
   if (filename) {
@@ -62,11 +80,41 @@ function detectLanguage(prompt, filename) {
   }
   const lower = (prompt || "").toLowerCase();
   for (const entry of KEYWORD_MAP) {
-    if (entry.keywords.some((kw) => lower.includes(kw))) {
+    if (entry.substrings.some((kw) => lower.includes(kw))) {
+      return entry.lang;
+    }
+    if (
+      entry.words.some((kw) =>
+        new RegExp(`\\b${escapeRegExp(kw)}\\b`).test(lower)
+      )
+    ) {
       return entry.lang;
     }
   }
   return "auto";
+}
+
+// Normalize an explicit language value (e.g. ?lang=py or "language": "C++")
+// to the canonical names used everywhere else in the app.
+const LANG_ALIASES = {
+  py: "python",
+  python3: "python",
+  js: "javascript",
+  node: "javascript",
+  nodejs: "javascript",
+  ts: "typescript",
+  "c++": "cpp",
+  golang: "go",
+  rs: "rust",
+  "c#": "csharp",
+  cs: "csharp",
+  sh: "bash",
+};
+
+function normalizeLanguage(lang) {
+  if (!lang || typeof lang !== "string") return "";
+  const cleaned = lang.trim().toLowerCase();
+  return LANG_ALIASES[cleaned] || cleaned;
 }
 
 function getClassName(filename) {
@@ -75,4 +123,4 @@ function getClassName(filename) {
   return base.charAt(0).toUpperCase() + base.slice(1);
 }
 
-module.exports = { detectLanguage, getClassName, EXTENSION_MAP };
+module.exports = { detectLanguage, getClassName, normalizeLanguage, EXTENSION_MAP };
