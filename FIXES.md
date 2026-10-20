@@ -454,3 +454,115 @@ runs: `Inorder traversal: [2, 3, 4, 5, 6, 7, 8]`).
 This section supersedes the naming wiring described in E2 (the route
 no longer routes the derived name through javaFixer; javaFixer no
 longer renames) and the "one retry" wording in section B.
+
+---
+
+## H. Phase-2 bug hunt — whole request lifecycle (2026-10-20)
+
+Method: an adversarial battery (59 checks) run BEFORE any fix:
+19 classroom questions (8 Java, 6 C, 5 Python) with realistic
+model-style outputs driven through the real route + pipeline and
+compiled/run with gcc/javac/python3; 12 direct post-processing
+probes; 19 request-lifecycle probes against the real server plus
+coalescing/semaphore burst probes; 9 provider-layer probes.
+Pre-fix battery: **49 passed, 10 failed**. Post-fix: **59/59**.
+
+### Bugs found (each reproduced first) and fixed
+
+**H1. Block-comment stripping ate string contents (C, Java).**
+`removeAllComments` removed `/* ... */` with a regex that knew
+nothing about string literals. Evidence (battery probe): cleaning
+`printf("/* done */\n")` produced `printf("\n")`; at route level the
+C file-copy program lost its printed `/* done */` marker.
+Fix: comment removal is now a whole-text scanner that tracks
+`'...'`, `"..."` and `` `...` `` literals; a block comment is
+replaced by a single space so tokens can never fuse (`int/**/x` →
+`int x`).
+
+**H2. Python triple-quoted strings were deleted as "comments".**
+The cleaner globally removed every `"""..."""` / `'''...'''` span.
+Those are strings: an assigned `TEXT = """alpha\nbeta"""` came back
+as `TEXT =` — a route-level **SyntaxError** in the battery's Python
+file-handling case — and function docstrings were silently deleted.
+Fix: triple-quoted spans are tracked as string state and never
+removed; only real `#` comments are stripped.
+
+**H3. Comment stripping lost string state at line boundaries.**
+Line comments were stripped per line with string state reset each
+line, so a `//` line inside a multi-line JS template literal was
+eaten as a comment (battery probe: the middle line of a template
+literal vanished) and a `#` line inside a Python multi-line string
+was exposed to the same treatment. Fix: the H1/H2 scanners walk the
+whole text once, so string state persists across lines; unterminated
+single/double-quoted literals resync at the newline.
+
+**H4. Fence stripping ate ``` inside string literals.**
+`stripMarkdownFences` replaced every ``` occurrence anywhere;
+`print("```")`-style content lost its string. Fix: fences are now
+line-based — only a line that is solely a fence (optional language
+tag), or an opening fence prefix sharing its line with code, is
+removed.
+
+**H5. POST ignored a query-string prompt (400) while GET accepted it.**
+`validateGenerateRequest` only fell back to `req.query` for GET, yet
+filename and language already fell back for every method. Evidence:
+`POST /api/generate?prompt=x` with an empty body → 400; the same URL
+as GET → 200. Fix: body fields still win, but the query string is
+now the fallback for all methods.
+
+Also in this commit (same root area): the old global
+`\n{3,}` → `\n\n` collapse in `removeAllComments` was dropped — it
+could rewrite blank lines inside multi-line strings — and the
+compile-check runners now execute programs with `cwd` set to their
+temp dir so file-IO fixtures can never write into the repo.
+
+### Checked, not reproduced (verified working, no change made)
+
+- **Question battery:** all 8 Java cases (linked list, array stack,
+  queue, inheritance incl. a URL inside a string literal, exception
+  handling, file handling, multithreading, CRUD class set) and the
+  remaining C/Python cases passed pre-fix; the only failures were
+  H1/H2 above.
+- **Groq model fallback** advances ONLY on `model_not_found`: 401
+  surfaces after exactly 1 attempt; 429/503 retry the SAME model
+  with backoff and then throw (battery + new unit test).
+  **NVIDIA**: candidate order (Nemotron Ultra first) and
+  `isModelNotFound` matching only 404/410 verified; chain-level
+  fallback order was already covered by the §F sticky tests.
+- **Retry-After parsing:** HTTP-date form honored (~120 s), numeric
+  `retryAfter` honored, garbage value falls back to the general
+  cooldown. Observed but NOT changed: a *string* `retryAfterSeconds`
+  ("45") is ignored and the 429 default (300 s) applies — provider
+  SDKs surface this field as a number and both header forms are
+  parsed, so this is a typing choice, not a proven failure.
+- **Lifecycle:** empty/whitespace q → 400; q > 10000 chars → 400
+  "Prompt too long"; `lang=JAVA` and `lang=" java "` work; POST body
+  prompt provably beats query q (cache-key evidence); unknown route
+  → 404 JSON; DELETE → 404 (Express has no 405 here); HEAD
+  /api/health → 200; OPTIONS preflight answered with CORS headers;
+  RateLimit headers present on /api responses (from the global
+  limiter); undetectable language → `auto`, no crash; URL-reserved
+  characters in q work when properly encoded.
+- **Cache/coalescing/semaphore:** same q + different lang and
+  different q + same lang never collide; 5 concurrent identical
+  requests = 1 provider call, 3 distinct = 3 calls; after a burst of
+  10 provider errors and a burst of 12 GENERATION_INVALIDs, 12 fresh
+  requests were all served (no semaphore slot leaks on either path);
+  `providerState` recovers when a cooldown expires (§F chain tests +
+  health test).
+- **Known residual limits (documented, unchanged):** the comment
+  scanners are structural heuristics — a JS regex literal containing
+  an unescaped `//`, or a Go raw string ending in a backslash, can
+  still desync them (the old per-line code had the same limits);
+  javaFixer's fence-line filter was inspected and left alone (it
+  only ever sees already-cleaned code; no damaging sample could be
+  produced).
+
+### Regression tests added
+
+12 cleaner string-safety tests + 3 validator-middleware tests + 1
+Groq 429 test in `npm test`; `npm run verify` gains the two battery
+failures as permanent fixtures (C file-copy, Python file-handling).
+
+`npm test`: **101 passed, 0 failed** (was 85). `npm run verify`:
+**21/21** (was 19). Battery: **59/59** (was 49/59).

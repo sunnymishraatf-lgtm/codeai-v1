@@ -5,14 +5,16 @@
 // (codeCleaner -> javaFixer -> codeValidator) actually compiles and runs
 // error-free for C, Java, and Python.
 //
-// Method: for 6 classic problems x 3 languages, plus a Java-only
-// multi-class regression case (binary tree with a nested node class),
-// take a REALISTIC MESSY raw output (markdown fences + chatter —
-// hand-written FIXTURES, labeled as such; these are NOT claimed to be
-// AI output), run it through the pipeline, write the result to a temp
-// file, then really compile/run it. For Java the file is named after
-// the class that actually contains main() in the fixture — the
-// pipeline must never rename a class to make a filename fit:
+// Method: for 6 classic problems x 3 languages, plus language-only
+// regression cases (Java binary tree with a nested node class, C file
+// copy printing a comment-like string, Python file handling with an
+// assigned triple-quoted string), take a REALISTIC MESSY raw output
+// (markdown fences + chatter — hand-written FIXTURES, labeled as
+// such; these are NOT claimed to be AI output), run it through the
+// pipeline, write the result to a temp file, then really compile/run
+// it. For Java the file is named after the class that actually
+// contains main() in the fixture — the pipeline must never rename a
+// class to make a filename fit:
 //   C      -> gcc -std=c11 ... && ./prog
 //   Python -> python3 file.py
 //   Java   -> javac File.java && java Class   (SKIPPED, with a loud
@@ -113,6 +115,26 @@ const PROBLEMS = [
     mustContain: ["static class TreeNode", "TreeNode(int data)"],
     java: "Here is the code:\n\n```java\nimport java.util.*;\n\npublic class BinaryTree {\n    static class TreeNode {\n        int data;\n        TreeNode left, right;\n        TreeNode(int data) { this.data = data; }\n    }\n    private TreeNode root;\n    public void insert(int value) { root = insertRec(root, value); }\n    private TreeNode insertRec(TreeNode node, int value) {\n        if (node == null) return new TreeNode(value);\n        if (value < node.data) node.left = insertRec(node.left, value);\n        else if (value > node.data) node.right = insertRec(node.right, value);\n        return node;\n    }\n    private void inorder(TreeNode node, List<Integer> list) {\n        if (node == null) return;\n        inorder(node.left, list);\n        list.add(node.data);\n        inorder(node.right, list);\n    }\n    public static void main(String[] args) {\n        BinaryTree tree = new BinaryTree();\n        int[] values = {5, 3, 7, 2, 4, 6, 8};\n        for (int v : values) tree.insert(v);\n        List<Integer> result = new ArrayList<>();\n        tree.inorder(tree.root, result);\n        System.out.println(\"Inorder traversal: \" + result);\n    }\n}\n```",
   },
+  {
+    // Regression case for FIXES.md H: the program prints a string
+    // containing a block-comment pattern ("/* done */"). The old
+    // regex-based comment stripper deleted the string's contents.
+    id: "file-copy",
+    prompt: "write a c program to copy a file",
+    expectedStdout: "/* done */",
+    expectStdoutAll: ["Copied: copy me", "/* done */"],
+    c: "```c\n#include <stdio.h>\n\nint main(void) {\n    FILE *src = fopen(\"source.txt\", \"w\");\n    fprintf(src, \"copy me\\n\");\n    fclose(src);\n    src = fopen(\"source.txt\", \"r\");\n    FILE *dst = fopen(\"dest.txt\", \"w\");\n    int ch;\n    while ((ch = fgetc(src)) != EOF) { fputc(ch, dst); }\n    fclose(src);\n    fclose(dst);\n    dst = fopen(\"dest.txt\", \"r\");\n    char buf[64];\n    if (fgets(buf, sizeof buf, dst)) { printf(\"Copied: %s\", buf); }\n    fclose(dst);\n    printf(\"/* done */\\n\");\n    return 0;\n}\n```",
+  },
+  {
+    // Regression case for FIXES.md H: an ASSIGNED triple-quoted string
+    // is data, not a comment. The old cleaner deleted every
+    // """...""" span, leaving `TEXT =` and a SyntaxError.
+    id: "file-handling-text",
+    prompt: "write a python program for file handling",
+    expectedStdout: "lines: 2",
+    expectStdoutAll: ["alpha", "beta", "lines: 2"],
+    python: "```python\nTEXT = \"\"\"alpha\nbeta\"\"\"\n\nwith open(\"notes.txt\", \"w\") as f:\n    f.write(TEXT)\n\nwith open(\"notes.txt\") as f:\n    content = f.read()\n\nprint(content)\nprint(\"lines:\", len(content.splitlines()))\n```",
+  },
 ];
 
 async function checkC(problem, dir) {
@@ -124,10 +146,14 @@ async function checkC(problem, dir) {
   fs.writeFileSync(file, code);
   const comp = await run("gcc", ["-std=c11", "-Wall", "-o", exe, file, "-lm"]);
   if (comp.code !== 0) return { status: "FAIL", detail: "gcc: " + comp.stderr.trim().slice(0, 300) };
-  const exec = await run(exe, []);
+  const exec = await run(exe, [], { cwd: dir });
   if (exec.code !== 0) return { status: "FAIL", detail: "run exit " + exec.code + ": " + exec.stderr.trim().slice(0, 200) };
   if (!exec.stdout.includes(problem.expectedStdout))
     return { status: "FAIL", detail: `stdout "${exec.stdout.trim()}" missing "${problem.expectedStdout}"` };
+  for (const frag of problem.expectStdoutAll || []) {
+    if (!exec.stdout.includes(frag))
+      return { status: "FAIL", detail: `stdout "${exec.stdout.trim()}" missing fragment "${frag}"` };
+  }
   return { status: "PASS", detail: `compiled + ran, stdout: ${exec.stdout.trim()}` };
 }
 
@@ -137,10 +163,14 @@ async function checkPython(problem, dir) {
   const v = validateCode(code, "python");
   if (!v.valid) return { status: "FAIL", detail: "validator: " + v.problems.join("; ") };
   fs.writeFileSync(file, code);
-  const exec = await run("python3", [file]);
+  const exec = await run("python3", [file], { cwd: dir });
   if (exec.code !== 0) return { status: "FAIL", detail: "python3: " + exec.stderr.trim().slice(0, 300) };
   if (!exec.stdout.includes(problem.expectedStdout))
     return { status: "FAIL", detail: `stdout "${exec.stdout.trim()}" missing "${problem.expectedStdout}"` };
+  for (const frag of problem.expectStdoutAll || []) {
+    if (!exec.stdout.includes(frag))
+      return { status: "FAIL", detail: `stdout "${exec.stdout.trim()}" missing fragment "${frag}"` };
+  }
   return { status: "PASS", detail: `ran, stdout: ${exec.stdout.trim()}` };
 }
 
@@ -168,7 +198,7 @@ async function checkJava(problem, dir, javacAvailable) {
   fs.writeFileSync(file, code);
   const comp = await run("javac", [file]);
   if (comp.code !== 0) return { status: "FAIL", detail: "javac: " + comp.stderr.trim().slice(0, 300) };
-  const exec = await run("java", ["-cp", dir, className]);
+  const exec = await run("java", ["-cp", dir, className], { cwd: dir });
   if (exec.code !== 0) return { status: "FAIL", detail: "java run: " + exec.stderr.trim().slice(0, 200) };
   if (!exec.stdout.includes(problem.expectedStdout))
     return { status: "FAIL", detail: `stdout "${exec.stdout.trim()}" missing "${problem.expectedStdout}"` };

@@ -270,7 +270,7 @@ codeai-project/
 │       ├── systemPrompt.js    # AI system prompt
 │       ├── langDetect.js      # Language auto-detection
 │       ├── cache.js           # In-memory response cache
-│       ├── codeCleaner.js     # Strip markdown/preamble
+│       ├── codeCleaner.js     # Strip markdown/preamble/comments (string-aware: never eats string contents)
 │       └── logger.js          # JSON structured logger
 ├── tests/
 │   ├── test.js                # Unit tests

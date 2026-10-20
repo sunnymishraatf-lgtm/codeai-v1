@@ -313,6 +313,88 @@ test("enum with constructor + constant class bodies is not flagged as orphan", (
   assert.strictEqual(r.valid, true, JSON.stringify(r.problems));
 });
 
+console.log("\n=== Cleaner String-Safety Regression Tests (FIXES.md H) ===");
+test("C: block-comment pattern inside a string literal survives cleaning", () => {
+  const out = cleanCode('#include <stdio.h>\nint main(void) { printf("/* done */\\n"); return 0; }', "c");
+  assert(out.includes("/* done */"), out);
+});
+test("Java: block-comment pattern inside a string literal survives cleaning", () => {
+  const out = cleanCode('public class T { public static void main(String[] a) { System.out.println("/* hi */"); } }', "java");
+  assert(out.includes("/* hi */"), out);
+});
+test("Java: URL string survives; trailing line comment removed", () => {
+  const out = cleanCode('String u = "https://example.com/a"; // trailingnote', "java");
+  assert(out.includes("https://example.com/a"), out);
+  assert(!out.includes("trailingnote"), out);
+});
+test("block comment between tokens becomes a space (tokens never fuse)", () => {
+  const out = cleanCode("int/**/x = 1;", "c");
+  assert(out.includes("int x = 1;"), out);
+});
+test("real C comments are still removed", () => {
+  const out = cleanCode("/* header note */\nint x = 1; // setx", "c");
+  assert(!out.includes("header note") && !out.includes("setx") && out.includes("int x = 1;"), out);
+});
+test("Python: assigned triple-quoted string keeps its content", () => {
+  const out = cleanCode('TEXT = """alpha\nbeta"""\nprint(TEXT)', "python");
+  assert(out.includes("alpha") && out.includes("beta"), JSON.stringify(out));
+});
+test("Python: '#' line inside a multi-line string survives", () => {
+  const out = cleanCode('s = """x\n# keepme\ny"""\nprint(s)', "python");
+  assert(out.includes("keepme"), JSON.stringify(out));
+});
+test("Python: '#' inside a string survives; real comment removed", () => {
+  const out = cleanCode('s = "a # b"  # realnote\nprint(s)', "python");
+  assert(out.includes("a # b") && !out.includes("realnote"), JSON.stringify(out));
+});
+test("Python: function docstring survives cleaning", () => {
+  const out = cleanCode('def f():\n    """Docstring text."""\n    return 1\nprint(f())', "python");
+  assert(out.includes("Docstring text."), JSON.stringify(out));
+});
+test("Python: shebang line is preserved, trailing comment removed", () => {
+  const out = cleanCode("#!/usr/bin/env python3\nprint('x') # zznote", "python");
+  assert(out.startsWith("#!/usr/bin/env python3"), JSON.stringify(out));
+  assert(!out.includes("zznote"), JSON.stringify(out));
+});
+test("JS: multi-line template literal with a // line survives", () => {
+  const out = cleanCode("const url = `https://example.com\n// stillstring\nend`;\nconsole.log(url);", "javascript");
+  assert(out.includes("stillstring"), JSON.stringify(out));
+});
+test("fence sequence inside a string literal survives cleaning", () => {
+  const out = cleanCode('s = "```"\nprint(s)', "python");
+  assert(out.includes('"```"'), JSON.stringify(out));
+});
+
+console.log("\n=== Request Validator Middleware Tests (FIXES.md H) ===");
+const { validateGenerateRequest } = require("../src/middleware/validator");
+function runValidator(reqProps) {
+  const req = { body: {}, query: {}, method: "GET", ...reqProps };
+  const res = {
+    statusCode: null,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.payload = payload; return this; },
+  };
+  let nextCalled = false;
+  validateGenerateRequest(req, res, () => { nextCalled = true; });
+  return { req, res, nextCalled };
+}
+test("POST with prompt only in the query string is accepted", () => {
+  const { req, res, nextCalled } = runValidator({ method: "POST", body: {}, query: { prompt: "hello" } });
+  assert.strictEqual(nextCalled, true);
+  assert.strictEqual(req.codePrompt, "hello");
+  assert.strictEqual(res.statusCode, null);
+});
+test("POST body prompt still wins over the query prompt", () => {
+  const { req } = runValidator({ method: "POST", body: { prompt: "frombody" }, query: { q: "fromquery" } });
+  assert.strictEqual(req.codePrompt, "frombody");
+});
+test("no prompt anywhere -> 400, next not called", () => {
+  const { res, nextCalled } = runValidator({ method: "POST", body: {}, query: {} });
+  assert.strictEqual(nextCalled, false);
+  assert.strictEqual(res.statusCode, 400);
+});
+
 console.log("\n=== Concurrency Semaphore Tests ===");
 const { Semaphore } = require("../src/utils/concurrency");
 test("semaphore never exceeds max concurrent", async () => {
@@ -942,6 +1024,24 @@ console.log(`=============================\n`);
       (err) => err.status === 401
     );
     assert.deepStrictEqual(tried, ["openai/gpt-oss-120b"]);
+  });
+  await atest("Groq: 429 retries the SAME model, never advances the fallback list", async () => {
+    const { callGroqWithRetry } = require("../src/utils/groqClient");
+    delete process.env.MODEL;
+    delete process.env.GROQ_MODELS;
+    const tried = [];
+    // TEST STUB (labeled fake): every attempt is rate-limited.
+    const createCompletion = async ({ model }) => {
+      tried.push(model);
+      const e = new Error("rate limited");
+      e.status = 429;
+      throw e;
+    };
+    await assert.rejects(
+      () => callGroqWithRetry([{ role: "user", content: "x" }], {}, 2, { createCompletion }),
+      (err) => err.status === 429
+    );
+    assert.deepStrictEqual(tried, ["openai/gpt-oss-120b", "openai/gpt-oss-120b"]);
   });
 
   console.log("\n=== Generate Route: validation / repair / cache rules (labeled fakes, TEST ONLY) ===");
