@@ -22,15 +22,28 @@ npm run dev        # development (auto-reload)
 
 ## AI Providers (failover)
 
-Requests are served by **Groq (primary)**. If Groq is not configured,
-fails, rate-limits, or times out, the server automatically falls back to
-**NVIDIA NIM (backup)**. If both fail, the client gets an honest error —
-never a crash or a hung connection.
+Requests are served by a three-leg failover chain — if a leg is not
+configured, fails, rate-limits, or times out, the next one is tried
+automatically. If every configured leg fails, the client gets an honest
+combined error — never a crash or a hung connection.
+
+```
+Plan A: Groq, primary key    (GROQ_API_KEY)
+          │  on any failure (incl. Plan A hitting its usage limit)
+          ▼
+Plan B: NVIDIA NIM           (NVIDIA_API_KEY)
+          │  on any failure
+          ▼
+Plan C: Groq, second key     (GROQ_API_KEY_2) — optional; a separate
+        Groq key kept in reserve so a second usage-limit pool exists
+        after both Plan A and Plan B are exhausted. Skipped when unset.
+```
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROQ_API_KEY` | *(one of the two keys is required)* | Groq API key (primary provider) |
-| `NVIDIA_API_KEY` | *(one of the two keys is required)* | NVIDIA NIM API key (backup provider) |
+| `GROQ_API_KEY` | *(at least one provider key is required)* | Groq API key — Plan A (primary provider) |
+| `NVIDIA_API_KEY` | *(at least one provider key is required)* | NVIDIA NIM API key — Plan B (backup provider) |
+| `GROQ_API_KEY_2` | *(optional)* | Second Groq API key — Plan C (reserve; used only after Plan A and Plan B both fail) |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (Nemotron — Sunny's requested backup family). **NVIDIA rotates/retires models** — this default was verified working live on 2026-10-20 with a real key (returned correct C code). Fallback chain: `nvidia/nemotron-3-ultra-550b-a55b` → `openai/gpt-oss-20b` (verified, correct Python code) → `google/gemma-4-31b-it` (verified answering). If the chosen model returns 404 or 410, the server automatically tries the next model. The three older NEUTRON-app catalog models currently fail live (410 Gone / 410 Gone / 404) and are no longer in the chain. Set `NVIDIA_MODEL` to override. |
 
 **Groq models rotate too.** `llama-3.3-70b-versatile` was moved to
@@ -40,7 +53,7 @@ If the chosen Groq model answers `model_not_found`, the server
 automatically tries the next model in the fallback chain (see
 `GROQ_MODELS` below) instead of failing the request.
 
-The response carries an `X-Provider: groq|nvidia` header so you can see
+The response carries an `X-Provider: groq|nvidia|groq2` header so you can see
 which provider answered. Generated code is structurally validated
 (C / Java / Python checks) before it is returned; if validation fails,
 the provider gets one self-repair retry with the problem fed back. The
@@ -50,8 +63,9 @@ final result is reported in the `X-Validation` header.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROQ_API_KEY` | required* | Your Groq API key (primary) |
-| `NVIDIA_API_KEY` | required* | Your NVIDIA NIM API key (backup) |
+| `GROQ_API_KEY` | required* | Your Groq API key — Plan A (primary) |
+| `NVIDIA_API_KEY` | required* | Your NVIDIA NIM API key — Plan B (backup) |
+| `GROQ_API_KEY_2` | *(none)* | Optional second Groq API key — Plan C (reserve; only used after Plan A and Plan B both fail, e.g. Plan A's key hit its limit) |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA model (see failover section; verified live 2026-10-20) |
 | `PORT` | `3000` | Server port |
 | `MODEL` | `openai/gpt-oss-120b` | Groq model to use. **Do not set `llama-3.3-70b-versatile`**: Groq moved it to enterprise-only pricing in Aug 2026, so free/self-serve keys get `404 model_not_found` (this broke the live deployment on 2026-10-20; `gpt-oss-120b` is the verified fix) |
@@ -218,7 +232,7 @@ codeai-project/
 │       ├── groqClient.js      # Groq API + retry + model fallback (primary provider)
 │       ├── className.js       # Derives problem-specific Java class names from prompts
 │       ├── nvidiaClient.js    # NVIDIA NIM API + model fallback (backup)
-│       ├── aiProvider.js      # Provider failover: Groq -> NVIDIA
+│       ├── aiProvider.js      # Provider failover: Groq (A) -> NVIDIA (B) -> Groq 2nd key (C)
 │       ├── concurrency.js     # AI concurrency semaphore + queue
 │       ├── codeValidator.js   # Structural validation of generated code
 │       ├── systemPrompt.js    # AI system prompt

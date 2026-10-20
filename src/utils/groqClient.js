@@ -58,19 +58,46 @@ function isModelNotFound(err) {
   return msg.includes("model_not_found") || msg.includes("does not exist");
 }
 
-let groqClient = null;
+// ---------------------------------------------------------------------------
+// PER-KEY CLIENTS (Plan A / Plan C)
+// Two independent Groq keys are supported: the primary key
+// (GROQ_API_KEY, Plan A) and an optional second key (GROQ_API_KEY_2,
+// Plan C — used by the provider chain only after NVIDIA has also
+// failed). Clients are cached per slot. Key values are never logged,
+// never included in errors beyond naming the env var to set.
+// ---------------------------------------------------------------------------
+const KEY_SLOTS = {
+  primary: "GROQ_API_KEY",
+  secondary: "GROQ_API_KEY_2",
+};
 
-function getClient() {
-  if (!groqClient) {
-    if (!process.env.GROQ_API_KEY) {
-      const err = new Error("GROQ_API_KEY is not set in environment variables.");
+const groqClients = {};
+
+function keySlotEnvVar(keySlot) {
+  return KEY_SLOTS[keySlot] || KEY_SLOTS.primary;
+}
+
+function normalizeKeySlot(keySlot) {
+  return keySlot === "secondary" ? "secondary" : "primary";
+}
+
+function hasGroqKey(keySlot = "primary") {
+  return !!process.env[keySlotEnvVar(keySlot)];
+}
+
+function getClient(keySlot = "primary") {
+  const slot = normalizeKeySlot(keySlot);
+  const envVar = keySlotEnvVar(slot);
+  if (!groqClients[slot]) {
+    if (!process.env[envVar]) {
+      const err = new Error(`${envVar} is not set in environment variables.`);
       err.code = "MISSING_API_KEY";
       err.status = 500;
       throw err;
     }
-    groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    groqClients[slot] = new Groq({ apiKey: process.env[envVar] });
   }
-  return groqClient;
+  return groqClients[slot];
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +110,7 @@ function getClient() {
 // `X-Test-Stub: 1` header. Never enable this in production.
 // ---------------------------------------------------------------------------
 let stubCallCount = 0;
+const stubCallCounts = { primary: 0, secondary: 0 };
 
 function isStubMode() {
   return process.env.CODEAI_TEST_STUB === "1";
@@ -92,8 +120,13 @@ function getStubCallCount() {
   return stubCallCount;
 }
 
-async function callStub(messages, options, model) {
+function getStubCallCountForSlot(keySlot = "primary") {
+  return stubCallCounts[normalizeKeySlot(keySlot)] || 0;
+}
+
+async function callStub(messages, options, model, keySlot = "primary") {
   stubCallCount++;
+  stubCallCounts[normalizeKeySlot(keySlot)]++;
   const delay = parseInt(process.env.CODEAI_TEST_STUB_DELAY_MS || "300", 10);
   logger.warn("TEST STUB in use — returning fake code, NOT real AI output", {
     stubCall: stubCallCount,
@@ -123,14 +156,15 @@ async function sleep(ms) {
 // never passes it.
 async function callGroqWithRetry(messages, options = {}, retries = 3, deps = {}) {
   const models = candidateModels(options);
+  const keySlot = normalizeKeySlot(options.keySlot);
 
   if (isStubMode()) {
-    return callStub(messages, options, models[0]);
+    return callStub(messages, options, models[0], keySlot);
   }
 
   const createCompletion =
     deps.createCompletion ||
-    (async (params) => getClient().chat.completions.create(params));
+    (async (params) => getClient(keySlot).chat.completions.create(params));
 
   const maxTokens = options.max_tokens || parseInt(process.env.MAX_TOKENS || "8192");
   const temperature = options.temperature ?? 0.1;
@@ -209,8 +243,11 @@ module.exports = {
   callGroqWithRetry,
   isStubMode,
   getStubCallCount,
+  getStubCallCountForSlot,
+  hasGroqKey,
   candidateModels,
   isModelNotFound,
   GROQ_MODELS: MODEL_FALLBACKS,
   DEFAULT_MODEL,
+  KEY_SLOTS,
 };

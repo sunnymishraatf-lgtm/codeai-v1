@@ -350,6 +350,123 @@ console.log(`=============================\n`);
     assert.strictEqual(isModelNotFound({ status: 500 }), false);
   });
 
+  console.log("\n=== Plan C Tests (second Groq key, stubbed providers, TEST ONLY) ===");
+  await atest("Plan C: Groq A throws + NVIDIA throws + Groq second key answers -> provider=groq2", async () => {
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      groq2Configured: () => true,
+      stubMode: () => false,
+      groqCall: async () => {
+        const e = new Error("groq A rate limited");
+        e.status = 429;
+        throw e;
+      },
+      nvidiaCall: async () => {
+        throw new Error("nvidia boom");
+      },
+      groq2Call: async () => ({ content: "plan-c code", usage: {}, model: "g2" }),
+    });
+    const r = await chain.callAI([], {});
+    assert.strictEqual(r.provider, "groq2");
+    assert.strictEqual(r.content, "plan-c code");
+  });
+  await atest("Plan C unset -> chain stays A->B only, combined error lists both legs", async () => {
+    let groq2Called = false;
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      groq2Configured: () => false,
+      stubMode: () => false,
+      groqCall: async () => {
+        throw new Error("groq boom");
+      },
+      nvidiaCall: async () => {
+        throw new Error("nvidia boom");
+      },
+      groq2Call: async () => {
+        groq2Called = true;
+        return { content: "must not happen", usage: {}, model: "g2" };
+      },
+    });
+    await assert.rejects(
+      () => chain.callAI([], {}),
+      (err) =>
+        err.code === "ALL_PROVIDERS_FAILED" &&
+        err.message.includes("groq boom") &&
+        err.message.includes("nvidia boom")
+    );
+    assert.strictEqual(groq2Called, false);
+  });
+  await atest("Plan A healthy -> NVIDIA and Plan C never invoked", async () => {
+    let nvidiaCalls = 0;
+    let groq2Calls = 0;
+    const chain = createProviderChain({
+      groqConfigured: () => true,
+      nvidiaConfigured: () => true,
+      groq2Configured: () => true,
+      stubMode: () => false,
+      groqCall: async () => ({ content: "a code", usage: {}, model: "g" }),
+      nvidiaCall: async () => {
+        nvidiaCalls++;
+        return { content: "b", usage: {}, model: "n" };
+      },
+      groq2Call: async () => {
+        groq2Calls++;
+        return { content: "c", usage: {}, model: "g2" };
+      },
+    });
+    const r = await chain.callAI([], {});
+    assert.strictEqual(r.provider, "groq");
+    assert.strictEqual(nvidiaCalls, 0);
+    assert.strictEqual(groq2Calls, 0);
+  });
+  await atest("Groq secondary slot without key -> MISSING_API_KEY naming GROQ_API_KEY_2", async () => {
+    const { callGroqWithRetry } = require("../src/utils/groqClient");
+    delete process.env.CODEAI_TEST_STUB;
+    delete process.env.GROQ_API_KEY_2;
+    await assert.rejects(
+      () => callGroqWithRetry([{ role: "user", content: "x" }], { keySlot: "secondary" }),
+      (err) =>
+        err.code === "MISSING_API_KEY" && err.message.includes("GROQ_API_KEY_2")
+    );
+  });
+  await atest("Groq stub counts calls per key slot", async () => {
+    const gc = require("../src/utils/groqClient");
+    process.env.CODEAI_TEST_STUB = "1";
+    try {
+      const beforePrimary = gc.getStubCallCountForSlot("primary");
+      const beforeSecondary = gc.getStubCallCountForSlot("secondary");
+      await gc.callGroqWithRetry([{ role: "user", content: "x" }], { keySlot: "secondary" });
+      await gc.callGroqWithRetry([{ role: "user", content: "x" }], {});
+      assert.strictEqual(gc.getStubCallCountForSlot("secondary"), beforeSecondary + 1);
+      assert.strictEqual(gc.getStubCallCountForSlot("primary"), beforePrimary + 1);
+    } finally {
+      delete process.env.CODEAI_TEST_STUB;
+    }
+  });
+  await atest("health providers include groq2 (false when unset, true when set)", async () => {
+    const express = require("express");
+    const adminRoute = require("../src/routes/admin");
+    const app = express();
+    app.use("/api", adminRoute);
+    const srv = app.listen(0);
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}/api/health`;
+      delete process.env.GROQ_API_KEY_2;
+      let body = await (await fetch(base)).json();
+      assert.strictEqual(body.providers.groq2, false);
+      assert.strictEqual(body.groq2KeyConfigured, false);
+      process.env.GROQ_API_KEY_2 = "test-only-not-a-real-key";
+      body = await (await fetch(base)).json();
+      assert.strictEqual(body.providers.groq2, true);
+      assert.strictEqual(body.groq2KeyConfigured, true);
+    } finally {
+      delete process.env.GROQ_API_KEY_2;
+      srv.close();
+    }
+  });
+
   console.log("\n=== Groq Model Fallback Tests (labeled stubs, TEST ONLY) ===");
   await atest("Groq candidate list defaults to gpt-oss-120b chain", async () => {
     const { candidateModels } = require("../src/utils/groqClient");

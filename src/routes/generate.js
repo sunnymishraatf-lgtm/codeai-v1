@@ -310,7 +310,8 @@ async function generateCode(req, res) {
       return res.status(502).json({
         error:
           "Code generation failed on all configured AI providers " +
-          "(Groq primary, NVIDIA backup). Please try again shortly.",
+          "(Plan A: Groq, Plan B: NVIDIA, Plan C: Groq second key). " +
+          "Please try again shortly.",
         detail: err.message,
         requestId,
       });

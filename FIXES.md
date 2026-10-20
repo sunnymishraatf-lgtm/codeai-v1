@@ -266,3 +266,41 @@ still passes 18/18.
   `X-Filename: BinarySearch.java`. The compile/run harness already
   used per-problem derived filenames, so it needed no weakening —
   still 18/18.
+
+---
+
+## E. Plan C (post-deploy addition, 2026-10-20)
+
+Sunny's request: add a **second Groq API key** as a reserve, so when the
+primary Groq key reaches its limit the app still has another engine.
+The failover chain is now three legs, in Sunny's stated order:
+
+- **Plan A:** Groq, primary key (`GROQ_API_KEY`)
+- **Plan B:** NVIDIA NIM (`NVIDIA_API_KEY`, Nemotron)
+- **Plan C:** Groq, second key (`GROQ_API_KEY_2`) — tried only when it
+  is set AND both Plan A and Plan B have failed; skipped silently
+  otherwise. Serving leg reported as `X-Provider: groq | nvidia | groq2`.
+
+Implementation:
+- `groqClient.js`: per-key clients (keyed cache by slot:
+  `primary`/`secondary`), `options.keySlot` selects the key; a missing
+  key for a slot throws the typed `MISSING_API_KEY` naming that slot's
+  env var. Model fallback behaviour is identical for both slots. Key
+  values are never logged. Test-stub counters are kept per slot.
+- `aiProvider.js`: chain A → B → C; `ALL_PROVIDERS_FAILED` lists every
+  attempted leg's reason; new `configuredProviders()` helper returns
+  `{ groq, nvidia, groq2 }` booleans. The validation self-repair retry
+  uses the same 3-leg chain (both route calls go through `callAI`,
+  inside the classroom semaphore + cache/coalescing wrapper, so Plan C
+  inherits both).
+- Health (`/api/health`): `providers: { groq, nvidia, groq2 }` plus
+  `groq2KeyConfigured`, same style as the existing booleans.
+- The key itself is **set on Render by the operator**
+  (`GROQ_API_KEY_2` env var; also declared `sync: false` in
+  `render.yaml`) — never in code, never committed.
+
+Tests: 6 new labeled-stub tests (Plan C answers after A+B fail; Plan C
+unset → A→B only with combined error; Plan A healthy → B and C never
+invoked; secondary slot missing-key error names `GROQ_API_KEY_2`;
+per-slot stub counts; health groq2 flag unset/set). `npm test`:
+67 passed, 0 failed. `npm run verify`: 18/18 unchanged.

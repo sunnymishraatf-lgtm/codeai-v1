@@ -2,21 +2,21 @@ const express = require("express");
 const router = express.Router();
 const { getCacheStats, flushCache } = require("../utils/cache");
 const { apiKeyAuth } = require("../middleware/auth");
+const { configuredProviders } = require("../utils/aiProvider");
 const os = require("os");
 
 router.get("/health", (req, res) => {
+  const providers = configuredProviders();
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
     env: process.env.NODE_ENV || "development",
     model: process.env.MODEL || "openai/gpt-oss-120b",
-    groqKeyConfigured: !!process.env.GROQ_API_KEY,
-    nvidiaKeyConfigured: !!process.env.NVIDIA_API_KEY,
-    providers: {
-      groq: !!process.env.GROQ_API_KEY,
-      nvidia: !!process.env.NVIDIA_API_KEY,
-    },
+    groqKeyConfigured: providers.groq,
+    nvidiaKeyConfigured: providers.nvidia,
+    groq2KeyConfigured: providers.groq2,
+    providers,
   });
 });
 

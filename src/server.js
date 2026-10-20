@@ -99,6 +99,7 @@ const server = app.listen(PORT, () => {
     model: process.env.MODEL || "openai/gpt-oss-120b",
     groqKeySet: !!process.env.GROQ_API_KEY,
     nvidiaKeySet: !!process.env.NVIDIA_API_KEY,
+    groq2KeySet: !!process.env.GROQ_API_KEY_2,
   });
 });
 
